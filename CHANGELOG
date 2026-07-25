@@ -1,5 +1,33 @@
 # Changelog - xcesp-l2tpv3d
 
+## 0.5.0
+
+- **XCESP integration milestone**: the daemon is now wired into the
+  XCESP control plane end-to-end.  Operators type
+  `type l2tp mode dynamic` in `xcespcli`, `commit; save; activate`,
+  and the per-router daemon comes up — no manual TOML editing, no
+  manual `systemctl enable`.  See [xcesppkg 0.4.7] and
+  [xcesp-on-rtr 0.2.17] for the corresponding XCESP-side changes.
+- **Per-router systemd template unit** — new
+  `contrib/systemd/xcesp-l2tpv3d@.service`.  One instance per XCESP
+  router (netns); matches the deployment model of
+  strongSwan/FRR/dhclient in XCESP.  Ambient caps:
+  `CAP_NET_BIND_SERVICE + CAP_NET_ADMIN` (bind UDP:1701, create
+  l2tpeth devices) + `CAP_SYS_ADMIN` (netns transition; dropped
+  after the wrapper's `nsenter` call).
+- **Launcher wrapper** — new
+  `contrib/scripts/xcesp-l2tpv3d-launch`.  `nsenter --net=/run/netns/<router>`
+  into the router's netns before exec'ing the daemon out of
+  `/var/xcesp/venv/bin/xcesp-l2tpv3d` (falls back to
+  `/usr/local/bin/xcesp-l2tpv3d` when installed outside the XCESP
+  venv).  Skips `nsenter` when the router is `default` (host netns).
+  Exits with clear diagnostics if the daemon binary, the config file,
+  or the netns are missing.
+- The single-instance `contrib/systemd/xcesp-l2tpv3d.service` unit
+  from 0.3.0-0.4.0 stays in the tree for standalone-testing use
+  cases (no XCESP install required).  Production XCESP deployments
+  use the template unit exclusively.
+
 ## 0.4.0
 
 - **Session state machine** (`xcesp_l2tpv3d/session_fsm.py`) — the

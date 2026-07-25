@@ -1,0 +1,52 @@
+#!/bin/sh
+# xcesp-l2tpv3d-launch — launcher wrapper for xcesp-l2tpv3d@.service
+#
+# Usage: xcesp-l2tpv3d-launch <router> <config.toml>
+#
+# Enters the router's network namespace via nsenter (skipped when the
+# router is "default" — the host netns) and execs the xcesp-l2tpv3d
+# daemon out of the XCESP venv.
+#
+# Rationale:
+#   - The daemon binds UDP:1701 and creates l2tpeth<sid> devices; both
+#     are per-netns kernel objects.  A daemon started in the host netns
+#     cannot touch a router's netns state.
+#   - We do the netns transition in a wrapper (not the daemon) so that
+#     the daemon stays trivially portable — it never has to know it is
+#     running inside XCESP.
+#   - CAP_SYS_ADMIN is required for setns(CLONE_NEWNET) and is granted
+#     to the systemd unit; nsenter inherits it as an ambient cap.
+
+set -eu
+
+router="${1:?router (systemd instance) name required}"
+config="${2:?config path required}"
+
+DAEMON=/var/xcesp/venv/bin/xcesp-l2tpv3d
+if [ ! -x "$DAEMON" ]; then
+    # Fallback for the "installed outside venv" path (xcesppkg's
+    # direct-install mode when python3-venv is unavailable).
+    DAEMON=/usr/local/bin/xcesp-l2tpv3d
+fi
+
+if [ ! -x "$DAEMON" ]; then
+    echo "xcesp-l2tpv3d-launch: daemon binary not found (looked in venv + /usr/local/bin)" >&2
+    exit 127
+fi
+
+if [ ! -r "$config" ]; then
+    echo "xcesp-l2tpv3d-launch: config $config not readable" >&2
+    exit 66
+fi
+
+if [ "$router" = "default" ]; then
+    exec "$DAEMON" --config "$config"
+fi
+
+NS_PATH="/run/netns/$router"
+if [ ! -e "$NS_PATH" ]; then
+    echo "xcesp-l2tpv3d-launch: netns $NS_PATH does not exist (router not up yet?)" >&2
+    exit 69
+fi
+
+exec /usr/bin/nsenter --net="$NS_PATH" -- "$DAEMON" --config "$config"

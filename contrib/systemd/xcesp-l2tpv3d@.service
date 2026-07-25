@@ -1,0 +1,42 @@
+[Unit]
+Description=XCESP L2TPv3 (RFC 3931) dynamic-mode daemon for router %i
+Documentation=https://github.com/aibarguen72/xcesp-l2tpv3d
+After=network-online.target syslog.target
+Wants=network-online.target
+
+# %i is the systemd instance name — the XCESP router (netns) name.
+# The launcher wrapper takes care of entering /run/netns/%i via nsenter
+# for non-default routers, and runs directly in the host netns when
+# %i = "default".
+
+[Service]
+Type=notify
+NotifyAccess=main
+
+# Wrapper handles nsenter and locates the daemon binary in the XCESP venv.
+ExecStart=/usr/lib/xcesp/xcesp-l2tpv3d-launch %i /var/xcesp/cfg/l2tpv3d/%i.toml
+Restart=on-failure
+RestartSec=5s
+
+# UDP:1701 bind + kernel L2TP netlink operations require these caps
+# regardless of uid.  CAP_SYS_ADMIN is needed only for the setns(2)
+# transition the wrapper performs via nsenter — dropped after entry.
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_SYS_ADMIN
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/xcesp/log /var/lib/xcesp
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+# XCESP service account (created by install.sh).  Falls back to root only
+# when the account is missing (never in a supported XCESP install).
+User=xcesp
+Group=xcesp
+
+[Install]
+WantedBy=multi-user.target
