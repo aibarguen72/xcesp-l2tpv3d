@@ -700,6 +700,72 @@ def find_avp(
 
 
 # ---------------------------------------------------------------------------
+# Additional session-level AVP decoders (0.4.0)
+# ---------------------------------------------------------------------------
+
+def decode_local_session_id(avp: AVP) -> int:
+    _require_attr(avp, AttrType.LOCAL_SESSION_ID, exact_len=4)
+    (sid,) = struct.unpack("!I", avp.value)
+    return sid
+
+
+def decode_remote_session_id(avp: AVP) -> int:
+    _require_attr(avp, AttrType.REMOTE_SESSION_ID, exact_len=4)
+    (sid,) = struct.unpack("!I", avp.value)
+    return sid
+
+
+def decode_pseudowire_type(avp: AVP) -> int:
+    _require_attr(avp, AttrType.PSEUDOWIRE_TYPE, exact_len=2)
+    (pw,) = struct.unpack("!H", avp.value)
+    return pw
+
+
+def decode_l2_specific_sublayer(avp: AVP) -> int:
+    _require_attr(avp, AttrType.L2_SPECIFIC_SUBLAYER, exact_len=2)
+    (v,) = struct.unpack("!H", avp.value)
+    return v
+
+
+def decode_data_sequencing(avp: AVP) -> int:
+    _require_attr(avp, AttrType.DATA_SEQUENCING, exact_len=2)
+    (v,) = struct.unpack("!H", avp.value)
+    return v
+
+
+def decode_circuit_status(avp: AVP) -> int:
+    _require_attr(avp, AttrType.CIRCUIT_STATUS, exact_len=2)
+    (v,) = struct.unpack("!H", avp.value)
+    return v
+
+
+def decode_assigned_cookie(avp: AVP) -> bytes:
+    _require_attr(avp, AttrType.ASSIGNED_COOKIE)
+    if len(avp.value) not in (0, 4, 8):
+        raise ValueError(
+            f"Assigned Cookie must be 0/4/8 bytes, got {len(avp.value)}"
+        )
+    return avp.value
+
+
+def decode_remote_end_id(avp: AVP) -> bytes:
+    _require_attr(avp, AttrType.REMOTE_END_ID)
+    return avp.value
+
+
+def decode_tx_connect_speed(avp: AVP) -> int:
+    _require_attr(avp, AttrType.TX_CONNECT_SPEED, exact_len=8)
+    (v,) = struct.unpack("!Q", avp.value)
+    return v
+
+
+def decode_rx_connect_speed(avp: AVP) -> int:
+    _require_attr(avp, AttrType.RX_CONNECT_SPEED, exact_len=8)
+    (v,) = struct.unpack("!Q", avp.value)
+    return v
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 

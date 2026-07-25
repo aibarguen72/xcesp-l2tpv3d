@@ -1,5 +1,98 @@
 # Changelog - xcesp-l2tpv3d
 
+## 0.4.0
+
+- **Session state machine** (`xcesp_l2tpv3d/session_fsm.py`) — the
+  RFC 3931 §7.4 state matrix for per-pseudowire sessions:
+  `IDLE` → `WAIT_SESSION_REPLY` (initiator sent ICRQ) or
+  `WAIT_SESSION_CONNECT` (responder sent ICRP) → `ESTABLISHED` →
+  `SEND_CDN` for teardown.  Symmetric roles: `initiator=true` sends
+  ICRQ once the parent tunnel reaches ESTABLISHED; `initiator=false`
+  waits for the peer's ICRQ.  Time- and I/O-agnostic like the other
+  FSMs — callers execute the returned Action list.  Actions:
+  `SendMessage`, `DataplaneAddSession`, `DataplaneDelSession`,
+  `SessionEstablished`, `SessionTornDown`.
+- **Session-level typed message builders** (`messages.py`) — one
+  factory per RFC 3931 §6.6–§6.9 message: ``build_icrq_avps``,
+  ``build_icrp_avps``, ``build_iccn_avps``, ``build_cdn_avps``.
+  Each populates mandatory AVPs (Local Session ID, Pseudowire Type,
+  Result Code where applicable) plus common optionals (Remote End
+  ID for peer-side session matching, Assigned Cookie, L2-Specific
+  Sublayer, Data Sequencing, Circuit Status, Tx/Rx Connect Speed,
+  Remote Session ID for handshake correlation).  Parsers
+  ``parse_session_fields`` / ``parse_cdn_fields`` extract typed
+  ``SessionFields`` / ``CdnFields`` dataclasses with mandatory-field
+  enforcement (Local Session ID always required).
+- **AVP decoders** added for every session-level type used at
+  0.4.0 (LOCAL/REMOTE_SESSION_ID, PSEUDOWIRE_TYPE,
+  L2_SPECIFIC_SUBLAYER, DATA_SEQUENCING, CIRCUIT_STATUS,
+  ASSIGNED_COOKIE, REMOTE_END_ID, TX/RX_CONNECT_SPEED).  Assigned
+  Cookie decoder enforces the 0/4/8-byte constraint from RFC 3931
+  §5.4.9.
+- **Dataplane abstraction** (`xcesp_l2tpv3d/dataplane.py`) — the
+  ``Dataplane`` ABC (``add_tunnel`` / ``add_session`` /
+  ``del_session`` / ``del_tunnel``) with two implementations:
+    * ``MockDataplane`` — records every call for pytest, enforces
+      basic invariants (add_session requires an existing tunnel,
+      del_tunnel refuses if sessions still live), returns the
+      caller's requested ``ifname``.  Used by every 0.4.0 unit +
+      integration test.
+    * ``IpCommandDataplane`` — subprocess to iproute2's
+      ``ip l2tp add tunnel|session`` / ``ip l2tp del …`` /
+      ``ip link set … up``.  Portable across every recent Linux
+      kernel with the L2TP driver.  Same code path XCESP's existing
+      static-L2TP mode already uses.  Requires ``CAP_NET_ADMIN`` in
+      production (the systemd unit already grants it).
+  A future release (0.4.1 or 0.5.x) will add a pyroute2 direct-
+  netlink implementation; 0.4.0's ``default_dataplane()`` returns
+  the IpCommand variant since it Just Works.
+- **Config extensions** (`config.py`) — new ``[[tunnel.session]]``
+  sub-blocks parsed into ``SessionConfigEntry``.  Fields: ``name``
+  (also used as Remote End ID for peer-side matching), ``local_sid``
+  (required, must be unique per tunnel), ``pseudowire_type``
+  (``ethernet`` or ``ethernet-vlan``), ``initiator`` (default true),
+  ``cookie`` / ``peer_cookie`` (hex, 0/4/8 bytes),
+  ``l2_specific_sublayer`` (0=none, 1=default), ``data_sequencing``
+  (0/1/2), ``circuit_status``, ``tx_connect_speed`` /
+  ``rx_connect_speed``, ``ifname``.  Duplicate names or SIDs within
+  a tunnel rejected.  All validation errors carry the offending
+  tunnel + session name for operator triage.
+- **Tunnel session lifecycle in `main.py`** — ``Tunnel`` now owns
+  per-session ``SessionFSM`` instances plus lookup maps indexed by
+  our local Session ID and by the peer's Local SID (needed for
+  ICRP/CDN correlation).  On the tunnel's ``Established`` action,
+  every configured session is kicked (initiator ones send ICRQ,
+  responders sit in IDLE).  Inbound session messages
+  (ICRQ/ICRP/ICCN/CDN) are dispatched to the right SessionFSM by
+  Remote Session ID, with fallback matching on Remote End ID for
+  new inbound ICRQs.  Dataplane add is lazy — the kernel tunnel
+  context is created on the first session's DataplaneAddSession
+  action so a keep-alive-only tunnel needs no dataplane at all
+  (no ``CAP_NET_ADMIN`` requirement).  On tunnel teardown,
+  sessions cascade: every session ``on_tunnel_down`` fires,
+  del_session flushes each netdev, then del_tunnel removes the
+  kernel tunnel context.
+- **Daemon dataplane wiring** — ``Daemon`` now takes an optional
+  ``dataplane=`` and passes it to each Tunnel.  ``_async_main``
+  instantiates ``default_dataplane()`` only when at least one
+  configured tunnel has sessions, so pure keep-alive deployments
+  don't require ``CAP_NET_ADMIN``.
+- **Unit tests grew 206 → 260** (+54): ``test_session_fsm.py`` (19),
+  ``test_dataplane.py`` (11), typed-session-message tests in
+  ``test_messages.py`` (~10), ``[[tunnel.session]]`` cases in
+  ``test_config.py`` (~11), three new integration tests
+  (``test_tunnel_with_one_session_reaches_established_end_to_end``,
+  ``test_session_local_close_tears_down_dataplane``,
+  ``test_tunnel_close_cascades_to_session_dataplane_teardown``).
+  All 260 green in ~13 s.
+- **Verification** — the roadmap's plan of record for 0.4.0 was
+  "Two Fedora VMs bring up tunnel+session; manually bridge
+  ``l2tpeth0`` on each; ping across."  0.4.0's in-process
+  MockDataplane test proves the FSM + dispatcher + dataplane call
+  ordering is correct; the two-VM verification with
+  ``IpCommandDataplane`` needs root + real hardware and is the
+  operator-driven test for this release.
+
 ## 0.3.0
 
 - **Tunnel state machine** (`xcesp_l2tpv3d/tunnel_fsm.py`) — the RFC

@@ -18,9 +18,11 @@ from xcesp_l2tpv3d.avp import (   # noqa: E402
 )
 from xcesp_l2tpv3d.messages import (  # noqa: E402
     HEADER_LEN, VERSION, ControlMessage,
-    build_hello_avps, build_sccrp_avps, build_sccrq_avps,
+    build_cdn_avps, build_hello_avps, build_iccn_avps, build_icrp_avps,
+    build_icrq_avps, build_sccrp_avps, build_sccrq_avps,
     build_scccn_avps, build_stopccn_avps,
-    get_message_type, parse_sccrx_fields, parse_stopccn_fields,
+    get_message_type, parse_cdn_fields, parse_sccrx_fields,
+    parse_session_fields, parse_stopccn_fields,
     seq_advance, seq_delta,
 )
 
@@ -455,3 +457,101 @@ def test_decode_and_verify_rejects_wrong_hash_type():
         ControlMessage.decode_and_verify(
             wire, DigestHash.HMAC_SHA1, _SIGNING_SECRET
         )
+
+
+# ---------------------------------------------------------------------------
+# Session-level typed builders + parsers (0.4.0)
+# ---------------------------------------------------------------------------
+
+def test_icrq_avps_carry_mandatory_fields():
+    avps = build_icrq_avps(
+        local_sid=100,
+        pseudowire_type=PseudowireType.ETHERNET,
+        remote_end_id="s1",
+        assigned_cookie=b"\x01\x02\x03\x04",
+    )
+    types = {a.attribute_type for a in avps}
+    assert get_message_type(avps) == int(MessageType.ICRQ)
+    assert int(AttrType.LOCAL_SESSION_ID) in types
+    assert int(AttrType.PSEUDOWIRE_TYPE) in types
+    assert int(AttrType.REMOTE_END_ID) in types
+    assert int(AttrType.ASSIGNED_COOKIE) in types
+    assert int(AttrType.L2_SPECIFIC_SUBLAYER) in types
+
+
+def test_icrp_avps_carry_local_and_remote_sid():
+    avps = build_icrp_avps(local_sid=200, remote_sid=100)
+    types = {a.attribute_type for a in avps}
+    assert get_message_type(avps) == int(MessageType.ICRP)
+    assert int(AttrType.LOCAL_SESSION_ID) in types
+    assert int(AttrType.REMOTE_SESSION_ID) in types
+
+
+def test_iccn_avps_carry_local_and_remote_sid():
+    avps = build_iccn_avps(local_sid=100, remote_sid=200)
+    types = {a.attribute_type for a in avps}
+    assert get_message_type(avps) == int(MessageType.ICCN)
+    assert int(AttrType.LOCAL_SESSION_ID) in types
+    assert int(AttrType.REMOTE_SESSION_ID) in types
+
+
+def test_cdn_avps_carry_result_code_and_sids():
+    avps = build_cdn_avps(local_sid=100, remote_sid=200, result_code=2)
+    types = {a.attribute_type for a in avps}
+    assert get_message_type(avps) == int(MessageType.CDN)
+    assert int(AttrType.LOCAL_SESSION_ID) in types
+    assert int(AttrType.REMOTE_SESSION_ID) in types
+    assert int(AttrType.RESULT_CODE) in types
+
+
+# Parsers
+
+def test_parse_session_fields_reads_icrq():
+    avps = build_icrq_avps(
+        local_sid=100,
+        pseudowire_type=PseudowireType.ETHERNET_VLAN,
+        remote_end_id="my-session",
+        assigned_cookie=b"\xde\xad\xbe\xef",
+        tx_connect_speed=1_000_000_000,
+    )
+    fields = parse_session_fields(avps)
+    assert fields.local_sid == 100
+    assert fields.remote_sid == 0   # ICRQ has no Remote SID
+    assert fields.pseudowire_type == int(PseudowireType.ETHERNET_VLAN)
+    assert fields.remote_end_id == b"my-session"
+    assert fields.assigned_cookie == b"\xde\xad\xbe\xef"
+    assert fields.tx_connect_speed == 1_000_000_000
+
+
+def test_parse_session_fields_reads_icrp():
+    avps = build_icrp_avps(local_sid=200, remote_sid=100)
+    fields = parse_session_fields(avps)
+    assert fields.local_sid == 200
+    assert fields.remote_sid == 100
+
+
+def test_parse_session_fields_rejects_missing_local_sid():
+    avps = [a for a in build_icrp_avps(local_sid=200, remote_sid=100)
+            if a.attribute_type != int(AttrType.LOCAL_SESSION_ID)]
+    with pytest.raises(ValueError, match="Local Session ID"):
+        parse_session_fields(avps)
+
+
+def test_parse_cdn_fields():
+    avps = build_cdn_avps(
+        local_sid=100, remote_sid=200, result_code=6, error_code=1,
+        error_message="admin shutdown",
+    )
+    fields = parse_cdn_fields(avps)
+    assert fields.local_sid == 100
+    assert fields.remote_sid == 200
+    assert fields.result_code == 6
+    assert fields.error_code == 1
+    assert fields.error_message == b"admin shutdown"
+
+
+def test_parse_cdn_missing_result_code_rejected():
+    avps = [a for a in build_cdn_avps(local_sid=100, remote_sid=200, result_code=1)
+            if a.attribute_type != int(AttrType.RESULT_CODE)]
+    with pytest.raises(ValueError, match="Result Code"):
+        parse_cdn_fields(avps)

@@ -30,26 +30,47 @@ from .avp import (
     AttrType,
     DigestHash,
     MessageType,
+    PseudowireType,
     VENDOR_IETF,
     build_assigned_control_connection_id,
+    build_assigned_cookie,
+    build_circuit_status,
     build_control_message_auth_nonce,
+    build_data_sequencing,
     build_firmware_revision,
     build_host_name,
+    build_l2_specific_sublayer,
+    build_local_session_id,
     build_message_digest,
     build_message_type,
     build_pseudowire_capabilities_list,
+    build_pseudowire_type,
     build_receive_window_size,
+    build_remote_end_id,
+    build_remote_session_id,
     build_result_code,
     build_router_id,
+    build_rx_connect_speed,
+    build_tx_connect_speed,
     build_vendor_name,
     decode_assigned_control_connection_id,
+    decode_assigned_cookie,
+    decode_circuit_status,
     decode_control_message_auth_nonce,
+    decode_data_sequencing,
     decode_host_name,
+    decode_l2_specific_sublayer,
+    decode_local_session_id,
     decode_message_type,
     decode_pseudowire_capabilities_list,
+    decode_pseudowire_type,
     decode_receive_window_size,
+    decode_remote_end_id,
+    decode_remote_session_id,
     decode_result_code,
     decode_router_id,
+    decode_rx_connect_speed,
+    decode_tx_connect_speed,
     find_avp,
 )
 
@@ -353,6 +374,227 @@ def build_stopccn_avps(
         build_assigned_control_connection_id(assigned_ccid),
         build_result_code(result_code, error_code, error_message),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Session-level typed message builders (RFC 3931 §6.6–§6.9)
+# ---------------------------------------------------------------------------
+
+def build_icrq_avps(
+    *,
+    local_sid: int,
+    pseudowire_type: PseudowireType | int,
+    remote_end_id: Optional[str] = None,
+    l2_specific_sublayer: int = 1,          # 1 = default sublayer, 0 = none
+    data_sequencing: int = 0,               # 0 = disabled
+    circuit_status: int = 0b11,             # bit0=up, bit1=new
+    assigned_cookie: Optional[bytes] = None,
+    tx_connect_speed: Optional[int] = None,
+    rx_connect_speed: Optional[int] = None,
+) -> List[AVP]:
+    """Assemble the AVP list for an Incoming-Call-Request (§6.6).
+
+    Mandatory: Message Type, Local Session ID, Pseudowire Type.  L2-
+    Specific Sublayer + Data Sequencing + Circuit Status are strongly
+    recommended for RFC-conformant handshake.  Remote End ID identifies
+    the session at the peer (used for demultiplexing when the peer has
+    multiple pre-configured sessions).
+    """
+    avps: List[AVP] = [
+        build_message_type(MessageType.ICRQ),
+        build_local_session_id(local_sid),
+        build_pseudowire_type(pseudowire_type),
+        build_l2_specific_sublayer(l2_specific_sublayer),
+        build_data_sequencing(data_sequencing),
+        build_circuit_status(circuit_status),
+    ]
+    if remote_end_id is not None:
+        avps.append(build_remote_end_id(remote_end_id))
+    if assigned_cookie is not None:
+        avps.append(build_assigned_cookie(assigned_cookie))
+    if tx_connect_speed is not None:
+        avps.append(build_tx_connect_speed(tx_connect_speed))
+    if rx_connect_speed is not None:
+        avps.append(build_rx_connect_speed(rx_connect_speed))
+    return avps
+
+
+def build_icrp_avps(
+    *,
+    local_sid: int,
+    remote_sid: int,
+    l2_specific_sublayer: int = 1,
+    data_sequencing: int = 0,
+    circuit_status: int = 0b11,
+    assigned_cookie: Optional[bytes] = None,
+    tx_connect_speed: Optional[int] = None,
+    rx_connect_speed: Optional[int] = None,
+) -> List[AVP]:
+    """Assemble the AVP list for an Incoming-Call-Reply (§6.7).
+
+    Mandatory: Message Type, Local Session ID.  Remote Session ID is
+    included so the initiator can correlate this ICRP with its earlier
+    ICRQ (whose Local Session ID equals our Remote Session ID here).
+    """
+    avps: List[AVP] = [
+        build_message_type(MessageType.ICRP),
+        build_local_session_id(local_sid),
+        build_remote_session_id(remote_sid),
+        build_l2_specific_sublayer(l2_specific_sublayer),
+        build_data_sequencing(data_sequencing),
+        build_circuit_status(circuit_status),
+    ]
+    if assigned_cookie is not None:
+        avps.append(build_assigned_cookie(assigned_cookie))
+    if tx_connect_speed is not None:
+        avps.append(build_tx_connect_speed(tx_connect_speed))
+    if rx_connect_speed is not None:
+        avps.append(build_rx_connect_speed(rx_connect_speed))
+    return avps
+
+
+def build_iccn_avps(
+    *,
+    local_sid: int,
+    remote_sid: int,
+    l2_specific_sublayer: int = 1,
+    data_sequencing: int = 0,
+    circuit_status: int = 0b11,
+    tx_connect_speed: Optional[int] = None,
+    rx_connect_speed: Optional[int] = None,
+) -> List[AVP]:
+    """Assemble the AVP list for an Incoming-Call-Connected (§6.8).
+
+    Mandatory: Message Type.  Also carries Local + Remote Session ID
+    so the responder can finalise binding.  L2-Specific Sublayer and
+    Data Sequencing must be present per RFC (they finalise the choice
+    from ICRQ+ICRP negotiation).
+    """
+    avps: List[AVP] = [
+        build_message_type(MessageType.ICCN),
+        build_local_session_id(local_sid),
+        build_remote_session_id(remote_sid),
+        build_l2_specific_sublayer(l2_specific_sublayer),
+        build_data_sequencing(data_sequencing),
+        build_circuit_status(circuit_status),
+    ]
+    if tx_connect_speed is not None:
+        avps.append(build_tx_connect_speed(tx_connect_speed))
+    if rx_connect_speed is not None:
+        avps.append(build_rx_connect_speed(rx_connect_speed))
+    return avps
+
+
+def build_cdn_avps(
+    *,
+    local_sid: int,
+    remote_sid: int,
+    result_code: int,
+    error_code: Optional[int] = None,
+    error_message: str = "",
+) -> List[AVP]:
+    """Assemble the AVP list for a Call-Disconnect-Notify (§6.9).
+
+    Mandatory: Message Type, Result Code, Local Session ID.  Remote
+    Session ID identifies the session at the recipient side (which is
+    the one being torn down).
+    """
+    return [
+        build_message_type(MessageType.CDN),
+        build_local_session_id(local_sid),
+        build_remote_session_id(remote_sid),
+        build_result_code(result_code, error_code, error_message),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Session-level parsers
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SessionFields:
+    """Fields extracted from any of ICRQ / ICRP / ICCN.
+
+    Not every AVP appears in every message — for ICRQ there's no
+    Remote Session ID (initiator doesn't know it yet); for ICRP+ICCN
+    it's mandatory.  Fields absent from the message are set to their
+    natural zero / None.
+    """
+
+    local_sid: int              # sender's Local Session ID
+    remote_sid: int             # sender's view of recipient's SID (0 for ICRQ)
+    pseudowire_type: Optional[int] = None    # present in ICRQ; usually omitted in ICRP/ICCN
+    l2_specific_sublayer: Optional[int] = None
+    data_sequencing: Optional[int] = None
+    circuit_status: Optional[int] = None
+    assigned_cookie: Optional[bytes] = None
+    remote_end_id: Optional[bytes] = None
+    tx_connect_speed: Optional[int] = None
+    rx_connect_speed: Optional[int] = None
+
+
+def parse_session_fields(avps: List[AVP]) -> SessionFields:
+    """Extract session-level fields from an AVP list.
+
+    Enforces that Local Session ID is present (mandatory in every
+    session-level message).  All other fields are optional at the
+    parser level; callers enforce message-type-specific requirements.
+    """
+    local_avp  = find_avp(avps, AttrType.LOCAL_SESSION_ID)
+    if local_avp is None:
+        raise ValueError("session message missing Local Session ID AVP")
+
+    remote_avp = find_avp(avps, AttrType.REMOTE_SESSION_ID)
+    pw_avp     = find_avp(avps, AttrType.PSEUDOWIRE_TYPE)
+    l2s_avp    = find_avp(avps, AttrType.L2_SPECIFIC_SUBLAYER)
+    ds_avp     = find_avp(avps, AttrType.DATA_SEQUENCING)
+    cs_avp     = find_avp(avps, AttrType.CIRCUIT_STATUS)
+    cookie_avp = find_avp(avps, AttrType.ASSIGNED_COOKIE)
+    eid_avp    = find_avp(avps, AttrType.REMOTE_END_ID)
+    tx_avp     = find_avp(avps, AttrType.TX_CONNECT_SPEED)
+    rx_avp     = find_avp(avps, AttrType.RX_CONNECT_SPEED)
+
+    return SessionFields(
+        local_sid=decode_local_session_id(local_avp),
+        remote_sid=decode_remote_session_id(remote_avp) if remote_avp else 0,
+        pseudowire_type=decode_pseudowire_type(pw_avp) if pw_avp else None,
+        l2_specific_sublayer=decode_l2_specific_sublayer(l2s_avp) if l2s_avp else None,
+        data_sequencing=decode_data_sequencing(ds_avp) if ds_avp else None,
+        circuit_status=decode_circuit_status(cs_avp) if cs_avp else None,
+        assigned_cookie=decode_assigned_cookie(cookie_avp) if cookie_avp else None,
+        remote_end_id=decode_remote_end_id(eid_avp) if eid_avp else None,
+        tx_connect_speed=decode_tx_connect_speed(tx_avp) if tx_avp else None,
+        rx_connect_speed=decode_rx_connect_speed(rx_avp) if rx_avp else None,
+    )
+
+
+@dataclass
+class CdnFields:
+    """Fields extracted from a CDN message."""
+
+    local_sid:     int
+    remote_sid:    int
+    result_code:   int
+    error_code:    Optional[int]
+    error_message: bytes
+
+
+def parse_cdn_fields(avps: List[AVP]) -> CdnFields:
+    local_avp  = find_avp(avps, AttrType.LOCAL_SESSION_ID)
+    remote_avp = find_avp(avps, AttrType.REMOTE_SESSION_ID)
+    rc_avp     = find_avp(avps, AttrType.RESULT_CODE)
+    if local_avp is None:
+        raise ValueError("CDN missing Local Session ID AVP")
+    if rc_avp is None:
+        raise ValueError("CDN missing Result Code AVP")
+    result, error, err_msg = decode_result_code(rc_avp)
+    return CdnFields(
+        local_sid=decode_local_session_id(local_avp),
+        remote_sid=decode_remote_session_id(remote_avp) if remote_avp else 0,
+        result_code=result,
+        error_code=error,
+        error_message=err_msg,
+    )
 
 
 # ---------------------------------------------------------------------------

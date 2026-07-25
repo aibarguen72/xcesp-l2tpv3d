@@ -27,9 +27,23 @@ from typing import Dict, List, Optional
 
 from . import __version__
 from . import log
-from .avp import find_avp, AttrType, VENDOR_IETF
+from .avp import find_avp, AttrType, MessageType, VENDOR_IETF
 from .config import DaemonConfig, TunnelConfigEntry, load_file, ConfigError
-from .messages import ControlMessage
+from .dataplane import (
+    Dataplane, MockDataplane, TunnelParams,
+    default_dataplane,
+)
+from .messages import ControlMessage, get_message_type, parse_session_fields, parse_cdn_fields
+from .session_fsm import (
+    DataplaneAddSession as SessDataplaneAdd,
+    DataplaneDelSession as SessDataplaneDel,
+    SendMessage as SessSendMessage,
+    SessionConfig,
+    SessionEstablished,
+    SessionFSM,
+    SessionState,
+    SessionTornDown,
+)
 from .transport import (
     L2TP_UDP_PORT,
     LoopbackTransport,
@@ -48,6 +62,16 @@ from .tunnel_fsm import (
     TunnelFSM,
     TunnelState,
 )
+
+
+# Set of message-type ints that belong to a session (dispatched to a
+# SessionFSM), not to the TunnelFSM.
+_SESSION_MSG_TYPES = frozenset({
+    int(MessageType.ICRQ),
+    int(MessageType.ICRP),
+    int(MessageType.ICCN),
+    int(MessageType.CDN),
+})
 
 
 _LOG = log.get("main")
@@ -74,11 +98,16 @@ class Tunnel:
         cfg: TunnelConfigEntry,
         transport: Transport,
         loop: asyncio.AbstractEventLoop,
+        dataplane: Optional[Dataplane] = None,
     ) -> None:
         self.name = cfg.name
         self.cfg  = cfg
         self._transport = transport
         self._loop = loop
+        # 0.4.0+: dataplane may be None only for the pure-FSM tests that
+        # don't exercise session establishment.  Session actions crash
+        # loudly if dataplane is None and a session ESTABLISHES.
+        self._dataplane = dataplane
 
         # remote_addr is the (host, port) tuple the transport sends to.
         # 0.3.0 uses IANA L2TP UDP port 1701 on both ends.
@@ -107,6 +136,33 @@ class Tunnel:
 
         # HELLO timer handle (cancellable).
         self._hello_handle: Optional[asyncio.TimerHandle] = None
+
+        # 0.4.0: session state.  Each configured session gets one
+        # SessionFSM.  Two lookup maps because inbound session
+        # messages arrive with different SID fields depending on
+        # direction (see _dispatch_session_message).
+        self._sessions_by_local:  Dict[int, SessionFSM] = {}
+        self._sessions_by_remote: Dict[int, SessionFSM] = {}
+        # Track whether we've told the dataplane about the tunnel yet
+        # (added once, when the first session ESTABLISHES).
+        self._tunnel_dp_added: bool = False
+        for scfg in cfg.sessions:
+            sess = SessionFSM(SessionConfig(
+                name=scfg.name,
+                local_ccid=cfg.local_ccid,
+                local_sid=scfg.local_sid,
+                pseudowire_type=int(scfg.pseudowire_type),
+                initiator=scfg.initiator,
+                l2_specific_sublayer=scfg.l2_specific_sublayer,
+                data_sequencing=scfg.data_sequencing,
+                circuit_status=scfg.circuit_status,
+                cookie=scfg.cookie,
+                peer_cookie=scfg.peer_cookie,
+                tx_connect_speed=scfg.tx_connect_speed,
+                rx_connect_speed=scfg.rx_connect_speed,
+                ifname=scfg.ifname,
+            ))
+            self._sessions_by_local[scfg.local_sid] = sess
 
     @property
     def local_ccid(self) -> int:
@@ -175,16 +231,20 @@ class Tunnel:
         for resp in responses:
             self._transport.send(self._remote_addr, resp.encode())
 
-        # If any AVPs were delivered, run them through the FSM.  A
-        # single Ns can bring one message with one Message Type AVP,
-        # so we assemble a virtual ControlMessage per delivered batch.
+        # If any AVPs were delivered, dispatch by message type:
+        # tunnel-level → TunnelFSM, session-level (ICRQ/ICRP/ICCN/CDN) →
+        # the matching SessionFSM.
         if delivered:
             virtual = ControlMessage(
                 control_connection_id=self._peer.local_ccid,
                 ns=msg.ns, nr=msg.nr, avps=delivered,
             )
-            actions = self._fsm.on_message(virtual)
-            self._execute_actions(actions)
+            mt = get_message_type(delivered)
+            if mt is not None and mt in _SESSION_MSG_TYPES:
+                self._dispatch_session_message(virtual, mt)
+            else:
+                actions = self._fsm.on_message(virtual)
+                self._execute_actions(actions)
 
     def tick(self, now: float) -> bool:
         """Run per-tick retransmit + dead-peer checks.
@@ -207,21 +267,11 @@ class Tunnel:
 
     def _execute_actions(self, actions: List[object]) -> None:
         for act in actions:
-            if isinstance(act, SendMessage):
-                # Wrap FSM's AVP list into a ControlMessage via the Peer
-                # (assigns Ns/Nr, queues for retransmit) and encode
-                # (signed if we have a secret).
-                now = self._loop.time()
-                msg = self._peer.send(act.avps, now=now)
-                if self.cfg.password:
-                    wire = msg.encode_signed(
-                        self.cfg.digest_alg, self.cfg.password
-                    )
-                else:
-                    wire = msg.encode()
-                self._transport.send(self._remote_addr, wire)
-                _LOG.debug("tunnel %s: sent Ns=%d (%d bytes)",
-                           self.name, msg.ns, len(wire))
+            # Tunnel + session share the SendMessage / other action types
+            # by name; isinstance handles both since they're distinct
+            # dataclass types from the two FSMs.
+            if isinstance(act, SendMessage) or isinstance(act, SessSendMessage):
+                self._send(act.avps)
             elif isinstance(act, SetHelloTimer):
                 if self._hello_handle is not None:
                     self._hello_handle.cancel()
@@ -235,8 +285,162 @@ class Tunnel:
             elif isinstance(act, Established):
                 _LOG.info("tunnel %s: ESTABLISHED (peer_ccid=%d)",
                           self.name, self._fsm.peer_ccid)
+                # Now that the tunnel is up, tell every session to kick
+                # off (initiator ones send ICRQ; responder-only ones
+                # just sit in IDLE waiting for peer's ICRQ).
+                for sess in self._sessions_by_local.values():
+                    sub_actions = sess.on_tunnel_established()
+                    self._execute_actions(sub_actions)
             elif isinstance(act, TornDown):
                 _LOG.info("tunnel %s: torn down — %s", self.name, act.reason)
+                # Cascade to every session so they clean their dataplane.
+                for sess in list(self._sessions_by_local.values()):
+                    sub_actions = sess.on_tunnel_down()
+                    self._execute_actions(sub_actions)
+                # After session cleanup, tear down the tunnel dataplane too.
+                if self._tunnel_dp_added and self._dataplane is not None:
+                    try:
+                        self._dataplane.del_tunnel(self.cfg.local_ccid)
+                    except Exception as exc:
+                        _LOG.warning("tunnel %s: dataplane del_tunnel failed: %s",
+                                     self.name, exc)
+                    self._tunnel_dp_added = False
+            elif isinstance(act, SessDataplaneAdd):
+                self._ensure_tunnel_dataplane()
+                if self._dataplane is None:
+                    _LOG.error("tunnel %s: session %d wants dataplane add "
+                               "but no dataplane configured",
+                               self.name, act.params.local_sid)
+                    continue
+                try:
+                    ifname = self._dataplane.add_session(act.params)
+                    _LOG.info("tunnel %s: session %d dataplane added → %s",
+                              self.name, act.params.local_sid, ifname)
+                except Exception as exc:
+                    _LOG.error("tunnel %s: session %d dataplane add failed: %s",
+                               self.name, act.params.local_sid, exc)
+            elif isinstance(act, SessDataplaneDel):
+                if self._dataplane is None:
+                    continue
+                try:
+                    self._dataplane.del_session(act.local_ccid, act.local_sid)
+                    _LOG.info("tunnel %s: session %d dataplane deleted",
+                              self.name, act.local_sid)
+                except Exception as exc:
+                    _LOG.warning("tunnel %s: session %d dataplane del failed: %s",
+                                 self.name, act.local_sid, exc)
+            elif isinstance(act, SessionEstablished):
+                # Actual info-log lives in the SessDataplaneAdd handler
+                # above (once we have the netdev name); nothing to do
+                # here beyond noting the transition happened.
+                pass
+            elif isinstance(act, SessionTornDown):
+                _LOG.info("tunnel %s: session torn down — %s",
+                          self.name, act.reason)
+
+    # ---- helpers -----------------------------------------------------
+
+    def _send(self, avps: List[object]) -> None:
+        """Common send path used by both tunnel + session SendMessage actions."""
+        now = self._loop.time()
+        msg = self._peer.send(avps, now=now)
+        if self.cfg.password:
+            wire = msg.encode_signed(self.cfg.digest_alg, self.cfg.password)
+        else:
+            wire = msg.encode()
+        self._transport.send(self._remote_addr, wire)
+        _LOG.debug("tunnel %s: sent Ns=%d (%d bytes)",
+                   self.name, msg.ns, len(wire))
+
+    def _dispatch_session_message(self, msg: ControlMessage, mt: int) -> None:
+        """Route an ICRQ/ICRP/ICCN/CDN to the right SessionFSM.
+
+        Correlation rules:
+          * ICRQ (mt=10) — new inbound session; peer's Local SID is in
+            the message.  We match against a configured session whose
+            Remote End ID matches, or fall back to any responder-role
+            session in IDLE with a free local_sid.
+          * ICRP (mt=11) — reply to our earlier ICRQ.  Peer's Local SID
+            is in the message; their echoed Remote Session ID equals
+            our local_sid.  Match by that.
+          * ICCN (mt=12) — the earlier ICRQ initiator finalising.
+            Match by the message's Remote Session ID (= our local_sid).
+          * CDN (mt=14) — teardown.  Match by Remote Session ID
+            (= our local_sid) if present; otherwise by Local Session
+            ID mapped through our remote-sid index.
+        """
+        try:
+            if mt == int(MessageType.CDN):
+                fields = parse_cdn_fields(msg.avps)
+                local_target = fields.remote_sid   # our local_sid
+                remote_key   = fields.local_sid
+            else:
+                fields = parse_session_fields(msg.avps)
+                local_target = fields.remote_sid
+                remote_key   = fields.local_sid
+        except ValueError as exc:
+            _LOG.warning("tunnel %s: dropping malformed session msg — %s",
+                         self.name, exc)
+            return
+
+        sess: Optional[SessionFSM] = None
+        if local_target and local_target in self._sessions_by_local:
+            sess = self._sessions_by_local[local_target]
+        elif mt == int(MessageType.ICRQ):
+            # Inbound ICRQ: pick a configured session matching Remote
+            # End ID (if any), else any responder-role session in IDLE.
+            end_id = fields.remote_end_id
+            for candidate in self._sessions_by_local.values():
+                if candidate.state != SessionState.IDLE:
+                    continue
+                if end_id is not None and candidate.config.name.encode() != end_id:
+                    continue
+                sess = candidate
+                break
+        elif remote_key and remote_key in self._sessions_by_remote:
+            # ICRP-late / CDN-with-missing-remote-sid fallback: match by
+            # peer's Local Session ID against our known peer_sid map.
+            sess = self._sessions_by_remote[remote_key]
+
+        if sess is None:
+            _LOG.debug("tunnel %s: no session found for msg type %d "
+                       "(local_target=%d, remote_key=%d)",
+                       self.name, mt, local_target, remote_key)
+            return
+
+        actions = sess.on_message(msg)
+        # After the message dispatch, refresh our by-remote-sid index
+        # since ICRQ/ICRP just learned the peer's SID.
+        if sess.peer_sid and sess.peer_sid not in self._sessions_by_remote:
+            self._sessions_by_remote[sess.peer_sid] = sess
+        self._execute_actions(actions)
+
+    def _ensure_tunnel_dataplane(self) -> None:
+        """Add the kernel tunnel context if not yet done.
+
+        Called lazily on the first session's DataplaneAdd action so we
+        don't create a kernel tunnel we'd never use (tunnel could have
+        no sessions — pure keep-alive mode).
+        """
+        if self._tunnel_dp_added or self._dataplane is None:
+            return
+        params = TunnelParams(
+            local_ccid=self.cfg.local_ccid,
+            remote_ccid=self._peer.remote_ccid,
+            local_address=self.cfg.local_address,
+            remote_address=self.cfg.remote_address,
+            encap="udp",
+            udp_sport=L2TP_UDP_PORT,
+            udp_dport=L2TP_UDP_PORT,
+        )
+        try:
+            self._dataplane.add_tunnel(params)
+            self._tunnel_dp_added = True
+            _LOG.info("tunnel %s: dataplane tunnel added (kernel CCID=%d)",
+                      self.name, self.cfg.local_ccid)
+        except Exception as exc:
+            _LOG.error("tunnel %s: dataplane add_tunnel failed: %s",
+                       self.name, exc)
 
     def _on_hello_timer(self) -> None:
         self._hello_handle = None
@@ -251,17 +455,26 @@ class Tunnel:
 class Daemon:
     """Owns the UDP socket + all configured Tunnels + the main loop."""
 
-    def __init__(self, cfg: DaemonConfig, transport: Transport) -> None:
+    def __init__(
+        self,
+        cfg: DaemonConfig,
+        transport: Transport,
+        dataplane: Optional[Dataplane] = None,
+    ) -> None:
         self.cfg = cfg
         self._transport = transport
         self._loop = asyncio.get_event_loop()
+        # 0.4.0+: dataplane is real (IpCommandDataplane by default) when
+        # any tunnel has sessions; None when no sessions configured (a
+        # keep-alive-only deployment doesn't need CAP_NET_ADMIN).
+        self._dataplane = dataplane
         self._tunnels: Dict[int, Tunnel] = {}   # keyed by local_ccid
         self._stopping = False
 
     async def start(self) -> None:
         # Instantiate one Tunnel per configured entry.
         for tcfg in self.cfg.tunnels:
-            t = Tunnel(tcfg, self._transport, self._loop)
+            t = Tunnel(tcfg, self._transport, self._loop, dataplane=self._dataplane)
             self._tunnels[t.local_ccid] = t
             t.start()   # send SCCRQ immediately (initiator role)
         _LOG.info("daemon: started with %d tunnel(s)", len(self._tunnels))
@@ -390,7 +603,19 @@ async def _async_main(cfg: DaemonConfig) -> int:
                    cfg.global_.listen_address, cfg.global_.listen_port, exc)
         return 3
 
-    daemon = Daemon(cfg, transport)
+    # Create a dataplane only if any tunnel has session configs — a
+    # keep-alive-only deployment doesn't need CAP_NET_ADMIN.
+    needs_dp = any(t.sessions for t in cfg.tunnels)
+    dp: Optional[Dataplane] = None
+    if needs_dp:
+        try:
+            dp = default_dataplane()
+        except Exception as exc:
+            _LOG.error("could not initialise dataplane: %s", exc)
+            transport.close()
+            return 3
+
+    daemon = Daemon(cfg, transport, dataplane=dp)
     stop_event = asyncio.Event()
 
     def _handle_sig() -> None:

@@ -11,10 +11,11 @@ _PKG_ROOT = Path(__file__).resolve().parent.parent
 if str(_PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(_PKG_ROOT))
 
-from xcesp_l2tpv3d.avp import DigestHash   # noqa: E402
+from xcesp_l2tpv3d.avp import DigestHash, PseudowireType   # noqa: E402
 from xcesp_l2tpv3d.config import (   # noqa: E402
     ConfigError,
     DaemonConfig,
+    SessionConfigEntry,
     load_file,
     load_string,
 )
@@ -260,3 +261,172 @@ def test_load_file_reads_disk(tmp_path):
 def test_load_file_missing_file_rejected(tmp_path):
     with pytest.raises(ConfigError, match="cannot read"):
         load_file(tmp_path / "does-not-exist.toml")
+
+
+# ---------------------------------------------------------------------------
+# [[tunnel.session]] sub-blocks (0.4.0)
+# ---------------------------------------------------------------------------
+
+def test_tunnel_with_no_sessions_has_empty_list():
+    cfg = load_string(_MINIMAL_TUNNEL)
+    assert cfg.tunnels[0].sessions == []
+
+
+def test_session_minimal_parses():
+    cfg = load_string(_MINIMAL_TUNNEL + """
+[[tunnel.session]]
+name       = "eth-xc"
+local_sid  = 42
+""")
+    t = cfg.tunnels[0]
+    assert len(t.sessions) == 1
+    s = t.sessions[0]
+    assert isinstance(s, SessionConfigEntry)
+    assert s.name == "eth-xc"
+    assert s.local_sid == 42
+    assert s.pseudowire_type == PseudowireType.ETHERNET   # default
+    assert s.initiator is True                              # default
+
+
+def test_session_ethernet_vlan_pseudowire():
+    cfg = load_string(_MINIMAL_TUNNEL + """
+[[tunnel.session]]
+name              = "vlan-xc"
+local_sid         = 10
+pseudowire_type   = "ethernet-vlan"
+initiator         = false
+""")
+    s = cfg.tunnels[0].sessions[0]
+    assert s.pseudowire_type == PseudowireType.ETHERNET_VLAN
+    assert s.initiator is False
+
+
+def test_session_full_optional_fields():
+    cfg = load_string(_MINIMAL_TUNNEL + """
+[[tunnel.session]]
+name              = "s1"
+local_sid         = 42
+cookie            = "01020304"
+peer_cookie       = "aabbccdd11223344"
+l2_specific_sublayer = 0
+data_sequencing   = 2
+circuit_status    = 3
+tx_connect_speed  = 10000000000
+rx_connect_speed  = 1000000000
+ifname            = "l2tpeth-custom"
+""")
+    s = cfg.tunnels[0].sessions[0]
+    assert s.cookie == b"\x01\x02\x03\x04"
+    assert s.peer_cookie == b"\xaa\xbb\xcc\xdd\x11\x22\x33\x44"
+    assert s.l2_specific_sublayer == 0
+    assert s.data_sequencing == 2
+    assert s.circuit_status == 3
+    assert s.tx_connect_speed == 10_000_000_000
+    assert s.rx_connect_speed == 1_000_000_000
+    assert s.ifname == "l2tpeth-custom"
+
+
+def test_two_sessions_in_one_tunnel():
+    cfg = load_string(_MINIMAL_TUNNEL + """
+[[tunnel.session]]
+name = "s1"
+local_sid = 1
+
+[[tunnel.session]]
+name = "s2"
+local_sid = 2
+""")
+    sessions = cfg.tunnels[0].sessions
+    assert [s.name for s in sessions] == ["s1", "s2"]
+    assert [s.local_sid for s in sessions] == [1, 2]
+
+
+def test_duplicate_session_name_rejected():
+    with pytest.raises(ConfigError, match="duplicate session name"):
+        load_string(_MINIMAL_TUNNEL + """
+[[tunnel.session]]
+name = "dup"
+local_sid = 1
+
+[[tunnel.session]]
+name = "dup"
+local_sid = 2
+""")
+
+
+def test_duplicate_session_local_sid_rejected():
+    with pytest.raises(ConfigError, match="duplicate local_sid"):
+        load_string(_MINIMAL_TUNNEL + """
+[[tunnel.session]]
+name = "a"
+local_sid = 42
+
+[[tunnel.session]]
+name = "b"
+local_sid = 42
+""")
+
+
+def test_session_missing_name_rejected():
+    with pytest.raises(ConfigError, match="missing required 'name'"):
+        load_string(_MINIMAL_TUNNEL + """
+[[tunnel.session]]
+local_sid = 1
+""")
+
+
+def test_session_missing_local_sid_rejected():
+    with pytest.raises(ConfigError, match="missing required 'local_sid'"):
+        load_string(_MINIMAL_TUNNEL + """
+[[tunnel.session]]
+name = "s"
+""")
+
+
+def test_session_local_sid_zero_rejected():
+    with pytest.raises(ConfigError, match="local_sid"):
+        load_string(_MINIMAL_TUNNEL + """
+[[tunnel.session]]
+name = "s"
+local_sid = 0
+""")
+
+
+def test_session_bad_pseudowire_type_rejected():
+    with pytest.raises(ConfigError, match="pseudowire_type"):
+        load_string(_MINIMAL_TUNNEL + """
+[[tunnel.session]]
+name = "s"
+local_sid = 1
+pseudowire_type = "hdlc"
+""")
+
+
+def test_session_bad_l2_sublayer_rejected():
+    with pytest.raises(ConfigError, match="l2_specific_sublayer"):
+        load_string(_MINIMAL_TUNNEL + """
+[[tunnel.session]]
+name = "s"
+local_sid = 1
+l2_specific_sublayer = 5
+""")
+
+
+def test_session_bad_cookie_length_rejected():
+    with pytest.raises(ConfigError, match="cookie must"):
+        load_string(_MINIMAL_TUNNEL + """
+[[tunnel.session]]
+name = "s"
+local_sid = 1
+cookie = "0102030405"
+""")   # 5 bytes — not 0/4/8
+
+
+def test_session_bad_cookie_hex_rejected():
+    with pytest.raises(ConfigError, match="valid hex"):
+        load_string(_MINIMAL_TUNNEL + """
+[[tunnel.session]]
+name = "s"
+local_sid = 1
+cookie = "not-hex"
+""")

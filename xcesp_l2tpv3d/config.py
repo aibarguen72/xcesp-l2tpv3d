@@ -59,7 +59,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional
 
-from .avp import DigestHash
+from .avp import DigestHash, PseudowireType
 
 
 class ConfigError(ValueError):
@@ -71,6 +71,30 @@ class GlobalConfig:
     log_level:      str = "info"
     listen_address: str = "0.0.0.0"
     listen_port:    int = 1701
+
+
+@dataclass
+class SessionConfigEntry:
+    """Per-session config inside a tunnel — [[tunnel.session]] block.
+
+    Both ends need a session with matching pseudowire_type, l2spec_type,
+    and complementary initiator flag (one true, one false).  The name
+    is used as the Remote End ID AVP for peer-side matching.
+    """
+
+    name:              str
+    pseudowire_type:   PseudowireType    # ethernet | ethernet-vlan
+    local_sid:         int
+    initiator:         bool = True
+
+    l2_specific_sublayer: int  = 1       # 1 = default, 0 = none
+    data_sequencing:      int  = 0
+    circuit_status:       int  = 0b11
+    cookie:               Optional[bytes] = None      # our cookie
+    peer_cookie:          Optional[bytes] = None      # peer's (pre-shared)
+    tx_connect_speed:     Optional[int] = None
+    rx_connect_speed:     Optional[int] = None
+    ifname:               Optional[str] = None        # kernel netdev name
 
 
 @dataclass
@@ -103,6 +127,8 @@ class TunnelConfigEntry:
 
     vendor_name:       Optional[str] = None
     firmware_revision: Optional[int] = None
+
+    sessions:          List[SessionConfigEntry] = field(default_factory=list)
 
 
 @dataclass
@@ -298,6 +324,34 @@ def _parse_tunnel(t: dict, source: str, *, index: int) -> TunnelConfigEntry:
                 f"{source}: tunnel {name!r} — firmware_revision must be 0..65535"
             )
 
+    # Parse any [[tunnel.session]] sub-blocks — array of tables under
+    # this tunnel.  Names must be unique within one tunnel.
+    sessions_raw = t.get("session", [])
+    if not isinstance(sessions_raw, list):
+        raise ConfigError(
+            f"{source}: tunnel {name!r} — 'session' must be array of tables"
+        )
+    sessions: List[SessionConfigEntry] = []
+    seen_names: set[str] = set()
+    seen_sids:  set[int] = set()
+    for si, sraw in enumerate(sessions_raw):
+        if not isinstance(sraw, dict):
+            raise ConfigError(
+                f"{source}: tunnel {name!r} session #{si} is not a table"
+            )
+        s = _parse_session(sraw, source, tunnel=name, index=si)
+        if s.name in seen_names:
+            raise ConfigError(
+                f"{source}: tunnel {name!r} — duplicate session name {s.name!r}"
+            )
+        if s.local_sid in seen_sids:
+            raise ConfigError(
+                f"{source}: tunnel {name!r} — duplicate local_sid {s.local_sid}"
+            )
+        seen_names.add(s.name)
+        seen_sids.add(s.local_sid)
+        sessions.append(s)
+
     return TunnelConfigEntry(
         name=name,
         local_address=local_address,
@@ -316,7 +370,125 @@ def _parse_tunnel(t: dict, source: str, *, index: int) -> TunnelConfigEntry:
         rx_connect_speed=rx_connect_speed,
         vendor_name=vendor_name,
         firmware_revision=firmware_revision,
+        sessions=sessions,
     )
+
+
+def _parse_session(
+    s: dict, source: str, *, tunnel: str, index: int
+) -> SessionConfigEntry:
+    def req(key: str, kind: type):
+        if key not in s:
+            raise ConfigError(
+                f"{source}: tunnel {tunnel!r} session #{index} — "
+                f"missing required {key!r}"
+            )
+        v = s[key]
+        if not isinstance(v, kind):
+            raise ConfigError(
+                f"{source}: tunnel {tunnel!r} session #{index} — "
+                f"{key!r} must be {kind.__name__}, got {type(v).__name__}"
+            )
+        return v
+
+    name       = req("name", str)
+    local_sid  = req("local_sid", int)
+    pw_raw     = str(s.get("pseudowire_type", "ethernet")).lower()
+
+    if not (0 < local_sid <= 0xFFFFFFFF):
+        raise ConfigError(
+            f"{source}: tunnel {tunnel!r} session {name!r} — local_sid "
+            f"must be 1..2^32-1"
+        )
+
+    if pw_raw == "ethernet":
+        pseudowire_type = PseudowireType.ETHERNET
+    elif pw_raw == "ethernet-vlan":
+        pseudowire_type = PseudowireType.ETHERNET_VLAN
+    else:
+        raise ConfigError(
+            f"{source}: tunnel {tunnel!r} session {name!r} — pseudowire_type "
+            f"must be 'ethernet' or 'ethernet-vlan', got {pw_raw!r}"
+        )
+
+    initiator = bool(s.get("initiator", True))
+    l2s = int(s.get("l2_specific_sublayer", 1))
+    if l2s not in (0, 1):
+        raise ConfigError(
+            f"{source}: tunnel {tunnel!r} session {name!r} — "
+            f"l2_specific_sublayer must be 0 (none) or 1 (default)"
+        )
+    data_seq = int(s.get("data_sequencing", 0))
+    if data_seq not in (0, 1, 2):
+        raise ConfigError(
+            f"{source}: tunnel {tunnel!r} session {name!r} — "
+            f"data_sequencing must be 0, 1, or 2"
+        )
+    circuit_status = int(s.get("circuit_status", 0b11))
+    if not (0 <= circuit_status <= 0xFFFF):
+        raise ConfigError(
+            f"{source}: tunnel {tunnel!r} session {name!r} — "
+            f"circuit_status must be a u16"
+        )
+
+    cookie = _parse_cookie(s.get("cookie"), source, tunnel, name, "cookie")
+    peer_cookie = _parse_cookie(
+        s.get("peer_cookie"), source, tunnel, name, "peer_cookie"
+    )
+
+    tx = s.get("tx_connect_speed")
+    rx = s.get("rx_connect_speed")
+    if tx is not None:
+        tx = int(tx)
+    if rx is not None:
+        rx = int(rx)
+
+    ifname = s.get("ifname")
+    if ifname is not None and not isinstance(ifname, str):
+        raise ConfigError(
+            f"{source}: tunnel {tunnel!r} session {name!r} — ifname must be str"
+        )
+
+    return SessionConfigEntry(
+        name=name,
+        pseudowire_type=pseudowire_type,
+        local_sid=local_sid,
+        initiator=initiator,
+        l2_specific_sublayer=l2s,
+        data_sequencing=data_seq,
+        circuit_status=circuit_status,
+        cookie=cookie,
+        peer_cookie=peer_cookie,
+        tx_connect_speed=tx,
+        rx_connect_speed=rx,
+        ifname=ifname,
+    )
+
+
+def _parse_cookie(
+    raw: Any, source: str, tunnel: str, session: str, key: str
+) -> Optional[bytes]:
+    """Accept a hex string ("deadbeef") of 0/4/8 bytes → bytes, or None."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ConfigError(
+            f"{source}: tunnel {tunnel!r} session {session!r} — {key} must be "
+            f"a hex string"
+        )
+    try:
+        b = bytes.fromhex(raw)
+    except ValueError as exc:
+        raise ConfigError(
+            f"{source}: tunnel {tunnel!r} session {session!r} — {key} is not "
+            f"valid hex: {exc}"
+        ) from exc
+    if len(b) not in (0, 4, 8):
+        raise ConfigError(
+            f"{source}: tunnel {tunnel!r} session {session!r} — {key} must "
+            f"decode to 0/4/8 bytes, got {len(b)}"
+        )
+    return b
 
 
 def _parse_router_id(raw: Any, source: str, tunnel_name: str) -> int:

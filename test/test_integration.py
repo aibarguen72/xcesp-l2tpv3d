@@ -24,13 +24,18 @@ _PKG_ROOT = Path(__file__).resolve().parent.parent
 if str(_PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(_PKG_ROOT))
 
-from xcesp_l2tpv3d.avp import DigestHash            # noqa: E402
-from xcesp_l2tpv3d.config import TunnelConfigEntry  # noqa: E402
-from xcesp_l2tpv3d.main import Tunnel                # noqa: E402
-from xcesp_l2tpv3d.transport import (               # noqa: E402
+from xcesp_l2tpv3d.avp import DigestHash, PseudowireType  # noqa: E402
+from xcesp_l2tpv3d.config import (                         # noqa: E402
+    SessionConfigEntry,
+    TunnelConfigEntry,
+)
+from xcesp_l2tpv3d.dataplane import MockDataplane         # noqa: E402
+from xcesp_l2tpv3d.main import Tunnel                     # noqa: E402
+from xcesp_l2tpv3d.session_fsm import SessionState        # noqa: E402
+from xcesp_l2tpv3d.transport import (                     # noqa: E402
     L2TP_UDP_PORT, LoopbackTransport,
 )
-from xcesp_l2tpv3d.tunnel_fsm import TunnelState    # noqa: E402
+from xcesp_l2tpv3d.tunnel_fsm import TunnelState          # noqa: E402
 
 
 def _cfg(
@@ -38,6 +43,7 @@ def _cfg(
     *,
     password: bytes | None = None,
     digest_alg: DigestHash = DigestHash.HMAC_MD5,
+    sessions: list | None = None,
 ) -> TunnelConfigEntry:
     return TunnelConfigEntry(
         name=name,
@@ -51,6 +57,19 @@ def _cfg(
         hello_interval=0.05,          # tight for tests
         retransmit_interval=0.02,
         max_retries=8,
+        sessions=sessions or [],
+    )
+
+
+def _session(
+    name: str, sid: int, *, initiator: bool = True,
+    pw: PseudowireType = PseudowireType.ETHERNET,
+) -> SessionConfigEntry:
+    return SessionConfigEntry(
+        name=name,
+        pseudowire_type=pw,
+        local_sid=sid,
+        initiator=initiator,
     )
 
 
@@ -244,3 +263,141 @@ async def test_local_close_transitions_to_send_stopccn():
         fabric, ta, tb, a, b,
     )
     assert b.state == TunnelState.IDLE
+
+
+# ---------------------------------------------------------------------------
+# 0.4.0: session over tunnel via LoopbackTransport + MockDataplane
+# ---------------------------------------------------------------------------
+
+def _session_states(t: Tunnel) -> dict[int, SessionState]:
+    return {sid: s.state for sid, s in t._sessions_by_local.items()}
+
+
+@pytest.mark.asyncio
+async def test_tunnel_with_one_session_reaches_established_end_to_end():
+    """A (initiator) + B (responder) tunnel + one Ethernet session
+    handshake to full ESTABLISHED and both dataplanes see add_session."""
+    fabric: dict = {}
+    ta = LoopbackTransport(("A", L2TP_UDP_PORT), fabric=fabric)
+    tb = LoopbackTransport(("B", L2TP_UDP_PORT), fabric=fabric)
+    dpa = MockDataplane()
+    dpb = MockDataplane()
+
+    a_cfg = _cfg("t", "A", "B", 100, "xcesp-A", 0x0A0A0A01,
+                 sessions=[_session("eth-xc", 42, initiator=True)])
+    b_cfg = _cfg("t", "B", "A", 200, "xcesp-B", 0x0B0B0B01,
+                 sessions=[_session("eth-xc", 99, initiator=False)])
+
+    a = Tunnel(a_cfg, ta, asyncio.get_event_loop(), dataplane=dpa)
+    b = Tunnel(b_cfg, tb, asyncio.get_event_loop(), dataplane=dpb)
+    a.start()
+
+    await _pump_until(
+        lambda: (a._sessions_by_local[42].state == SessionState.ESTABLISHED
+                 and b._sessions_by_local[99].state == SessionState.ESTABLISHED),
+        fabric, ta, tb, a, b,
+        max_iterations=200,
+    )
+
+    # Tunnels also up.
+    assert a.state == TunnelState.ESTABLISHED
+    assert b.state == TunnelState.ESTABLISHED
+
+    # Both dataplanes saw add_tunnel + add_session.
+    a_kinds = [k for k, _ in dpa.calls]
+    b_kinds = [k for k, _ in dpb.calls]
+    assert "add_tunnel" in a_kinds and "add_session" in a_kinds
+    assert "add_tunnel" in b_kinds and "add_session" in b_kinds
+
+    # Netdev names match the derived pattern.
+    a_add = next(v for k, v in dpa.calls if k == "add_session")
+    b_add = next(v for k, v in dpb.calls if k == "add_session")
+    assert a_add.ifname == "l2tpeth-100-42"
+    assert b_add.ifname == "l2tpeth-200-99"
+
+    # Cross-check SIDs match up.
+    assert a_add.local_sid == 42 and a_add.remote_sid == 99
+    assert b_add.local_sid == 99 and b_add.remote_sid == 42
+
+
+@pytest.mark.asyncio
+async def test_session_local_close_tears_down_dataplane():
+    fabric: dict = {}
+    ta = LoopbackTransport(("A", L2TP_UDP_PORT), fabric=fabric)
+    tb = LoopbackTransport(("B", L2TP_UDP_PORT), fabric=fabric)
+    dpa = MockDataplane()
+    dpb = MockDataplane()
+
+    a_cfg = _cfg("t", "A", "B", 100, "xcesp-A", 0x0A0A0A01,
+                 sessions=[_session("eth-xc", 42, initiator=True)])
+    b_cfg = _cfg("t", "B", "A", 200, "xcesp-B", 0x0B0B0B01,
+                 sessions=[_session("eth-xc", 99, initiator=False)])
+
+    a = Tunnel(a_cfg, ta, asyncio.get_event_loop(), dataplane=dpa)
+    b = Tunnel(b_cfg, tb, asyncio.get_event_loop(), dataplane=dpb)
+    a.start()
+
+    await _pump_until(
+        lambda: (a._sessions_by_local[42].state == SessionState.ESTABLISHED
+                 and b._sessions_by_local[99].state == SessionState.ESTABLISHED),
+        fabric, ta, tb, a, b,
+        max_iterations=200,
+    )
+
+    # A closes only the session (via local session close), not the tunnel.
+    a_sess = a._sessions_by_local[42]
+    for act in a_sess.on_local_close():
+        a._execute_actions([act])
+
+    # Pump until B's session goes IDLE (received CDN, cleaned up dataplane).
+    await _pump_until(
+        lambda: b._sessions_by_local[99].state == SessionState.IDLE,
+        fabric, ta, tb, a, b,
+        max_iterations=200,
+    )
+
+    # Both dataplanes should show del_session.
+    assert any(k == "del_session" for k, _ in dpa.calls)
+    assert any(k == "del_session" for k, _ in dpb.calls)
+
+
+@pytest.mark.asyncio
+async def test_tunnel_close_cascades_to_session_dataplane_teardown():
+    fabric: dict = {}
+    ta = LoopbackTransport(("A", L2TP_UDP_PORT), fabric=fabric)
+    tb = LoopbackTransport(("B", L2TP_UDP_PORT), fabric=fabric)
+    dpa = MockDataplane()
+    dpb = MockDataplane()
+
+    a_cfg = _cfg("t", "A", "B", 100, "xcesp-A", 0x0A0A0A01,
+                 sessions=[_session("s", 42, initiator=True)])
+    b_cfg = _cfg("t", "B", "A", 200, "xcesp-B", 0x0B0B0B01,
+                 sessions=[_session("s", 99, initiator=False)])
+
+    a = Tunnel(a_cfg, ta, asyncio.get_event_loop(), dataplane=dpa)
+    b = Tunnel(b_cfg, tb, asyncio.get_event_loop(), dataplane=dpb)
+    a.start()
+    await _pump_until(
+        lambda: (a._sessions_by_local[42].state == SessionState.ESTABLISHED
+                 and b._sessions_by_local[99].state == SessionState.ESTABLISHED),
+        fabric, ta, tb, a, b,
+        max_iterations=200,
+    )
+
+    # A closes the tunnel — cascade should also tear down the session on A
+    # AND propagate a StopCCN which tears down B's session too.
+    a.close()
+
+    await _pump_until(
+        lambda: b.state == TunnelState.IDLE,
+        fabric, ta, tb, a, b,
+        max_iterations=200,
+    )
+
+    # A's dataplane: added session, then deleted session, then del_tunnel.
+    a_kinds = [k for k, _ in dpa.calls]
+    assert a_kinds.count("add_session") == 1
+    assert a_kinds.count("del_session") == 1
+    assert a_kinds.count("del_tunnel") == 1
+    # Ordering: del_session must precede del_tunnel.
+    assert a_kinds.index("del_session") < a_kinds.index("del_tunnel")
