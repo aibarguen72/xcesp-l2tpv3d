@@ -13,10 +13,15 @@ if str(_PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(_PKG_ROOT))
 
 from xcesp_l2tpv3d.avp import (   # noqa: E402
-    AttrType, MessageType, build_message_type, build_router_id,
+    AttrType, DigestHash, MessageType, PseudowireType,
+    build_message_type, build_router_id,
 )
 from xcesp_l2tpv3d.messages import (  # noqa: E402
-    HEADER_LEN, VERSION, ControlMessage, seq_advance, seq_delta,
+    HEADER_LEN, VERSION, ControlMessage,
+    build_hello_avps, build_sccrp_avps, build_sccrq_avps,
+    build_scccn_avps, build_stopccn_avps,
+    get_message_type, parse_sccrx_fields, parse_stopccn_fields,
+    seq_advance, seq_delta,
 )
 
 
@@ -226,3 +231,227 @@ def test_seq_advance_wraps_at_65535():
 
 def test_seq_advance_can_go_by_arbitrary_amount():
     assert seq_advance(1000, by=500) == 1500
+
+
+# ---------------------------------------------------------------------------
+# Typed message builders (0.3.0)
+# ---------------------------------------------------------------------------
+
+def _sccrq_kwargs(**overrides):
+    base = dict(
+        router_id=0x0A0A0A01,
+        assigned_ccid=0x1234,
+        host_name="xcespfc",
+        pw_capabilities=[int(PseudowireType.ETHERNET),
+                          int(PseudowireType.ETHERNET_VLAN)],
+        receive_window=4,
+    )
+    base.update(overrides)
+    return base
+
+
+def test_sccrq_avps_contains_all_mandatory():
+    avps = build_sccrq_avps(**_sccrq_kwargs())
+    types_in_message = {a.attribute_type for a in avps}
+    assert int(AttrType.MESSAGE_TYPE) in types_in_message
+    assert int(AttrType.ROUTER_ID) in types_in_message
+    assert int(AttrType.ASSIGNED_CONTROL_CONNECTION_ID) in types_in_message
+    assert int(AttrType.PSEUDOWIRE_CAPABILITIES_LIST) in types_in_message
+    assert int(AttrType.HOST_NAME) in types_in_message
+    assert int(AttrType.RECEIVE_WINDOW_SIZE) in types_in_message
+    assert get_message_type(avps) == int(MessageType.SCCRQ)
+
+
+def test_sccrq_avps_includes_optional_when_provided():
+    avps = build_sccrq_avps(**_sccrq_kwargs(
+        vendor_name="XCESP",
+        firmware_revision=42,
+        auth_nonce=b"\x01" * 32,
+    ))
+    types = {a.attribute_type for a in avps}
+    assert int(AttrType.VENDOR_NAME) in types
+    assert int(AttrType.FIRMWARE_REVISION) in types
+    assert int(AttrType.CTL_MSG_AUTH_NONCE) in types
+
+
+def test_sccrq_avps_omits_optional_when_absent():
+    avps = build_sccrq_avps(**_sccrq_kwargs())
+    types = {a.attribute_type for a in avps}
+    assert int(AttrType.VENDOR_NAME) not in types
+    assert int(AttrType.FIRMWARE_REVISION) not in types
+    assert int(AttrType.CTL_MSG_AUTH_NONCE) not in types
+
+
+def test_sccrp_mirrors_sccrq_with_different_message_type():
+    kwargs = _sccrq_kwargs()
+    sccrq = build_sccrq_avps(**kwargs)
+    sccrp = build_sccrp_avps(**kwargs)
+    assert get_message_type(sccrq) == int(MessageType.SCCRQ)
+    assert get_message_type(sccrp) == int(MessageType.SCCRP)
+    # Everything else identical
+    sccrq_no_mt = [a for a in sccrq if a.attribute_type != int(AttrType.MESSAGE_TYPE)]
+    sccrp_no_mt = [a for a in sccrp if a.attribute_type != int(AttrType.MESSAGE_TYPE)]
+    assert [(a.attribute_type, a.value) for a in sccrq_no_mt] == \
+           [(a.attribute_type, a.value) for a in sccrp_no_mt]
+
+
+def test_scccn_is_message_type_only():
+    avps = build_scccn_avps()
+    assert len(avps) == 1
+    assert get_message_type(avps) == int(MessageType.SCCCN)
+
+
+def test_hello_is_message_type_only():
+    avps = build_hello_avps()
+    assert len(avps) == 1
+    assert get_message_type(avps) == int(MessageType.HELLO)
+
+
+def test_stopccn_carries_result_code_and_ccid():
+    avps = build_stopccn_avps(assigned_ccid=0xABCD, result_code=1)
+    assert get_message_type(avps) == int(MessageType.StopCCN)
+    types = {a.attribute_type for a in avps}
+    assert int(AttrType.ASSIGNED_CONTROL_CONNECTION_ID) in types
+    assert int(AttrType.RESULT_CODE) in types
+
+
+# ---------------------------------------------------------------------------
+# Parsers
+# ---------------------------------------------------------------------------
+
+def test_parse_sccrx_extracts_all_mandatory_fields():
+    avps = build_sccrq_avps(**_sccrq_kwargs(
+        router_id=0x0A0A0A02, assigned_ccid=42, host_name="peer",
+        pw_capabilities=[int(PseudowireType.ETHERNET)],
+        receive_window=8,
+    ))
+    fields = parse_sccrx_fields(avps)
+    assert fields.router_id == 0x0A0A0A02
+    assert fields.assigned_ccid == 42
+    assert fields.host_name == b"peer"
+    assert fields.pw_capabilities == [int(PseudowireType.ETHERNET)]
+    assert fields.receive_window == 8
+    assert fields.auth_nonce is None
+
+
+def test_parse_sccrx_extracts_optional_nonce():
+    nonce = b"\xa5" * 32
+    avps = build_sccrq_avps(**_sccrq_kwargs(auth_nonce=nonce))
+    fields = parse_sccrx_fields(avps)
+    assert fields.auth_nonce == nonce
+
+
+def test_parse_sccrx_rejects_missing_mandatory():
+    # Build SCCRQ, then drop the Router ID AVP.
+    avps = [a for a in build_sccrq_avps(**_sccrq_kwargs())
+            if a.attribute_type != int(AttrType.ROUTER_ID)]
+    with pytest.raises(ValueError, match="Router ID"):
+        parse_sccrx_fields(avps)
+
+
+def test_parse_stopccn_extracts_fields():
+    avps = build_stopccn_avps(
+        assigned_ccid=99, result_code=1, error_code=2,
+        error_message="teardown",
+    )
+    fields = parse_stopccn_fields(avps)
+    assert fields.assigned_ccid == 99
+    assert fields.result_code == 1
+    assert fields.error_code == 2
+    assert fields.error_message == b"teardown"
+
+
+def test_parse_stopccn_rejects_missing_result_code():
+    avps = [a for a in build_stopccn_avps(assigned_ccid=1, result_code=0)
+            if a.attribute_type != int(AttrType.RESULT_CODE)]
+    with pytest.raises(ValueError, match="Result Code"):
+        parse_stopccn_fields(avps)
+
+
+# ---------------------------------------------------------------------------
+# ControlMessage.encode_signed / decode_and_verify (0.3.0)
+# ---------------------------------------------------------------------------
+
+_SIGNING_SECRET = b"unit-test-shared-secret"
+
+
+def test_encode_signed_appends_message_digest_avp():
+    avps = build_hello_avps()
+    msg = ControlMessage(control_connection_id=1, ns=0, nr=0, avps=avps)
+    wire = msg.encode_signed(DigestHash.HMAC_MD5, _SIGNING_SECRET)
+    # Wire should be longer than the un-signed encoding by exactly
+    # the size of a Message Digest AVP (header + hash_type + digest).
+    unsigned = msg.encode()
+    md_avp_size = 6 + 1 + 16   # AVP header + hash_type + md5 digest
+    assert len(wire) == len(unsigned) + md_avp_size
+
+    # And the wire should now be decodable, with the digest AVP present.
+    decoded = ControlMessage.decode(wire)
+    types = {a.attribute_type for a in decoded.avps}
+    assert int(AttrType.MESSAGE_DIGEST) in types
+
+
+@pytest.mark.parametrize("hash_type", [DigestHash.HMAC_MD5, DigestHash.HMAC_SHA1])
+def test_encode_signed_and_decode_and_verify_roundtrip(hash_type):
+    avps = build_sccrq_avps(**_sccrq_kwargs())
+    msg = ControlMessage(control_connection_id=1, ns=5, nr=3, avps=avps)
+    wire = msg.encode_signed(hash_type, _SIGNING_SECRET)
+
+    verified = ControlMessage.decode_and_verify(
+        wire, hash_type, _SIGNING_SECRET
+    )
+    assert verified.control_connection_id == 1
+    assert verified.ns == 5
+    assert verified.nr == 3
+    # The original AVPs are preserved (plus the digest AVP appended).
+    original_types = [a.attribute_type for a in msg.avps]
+    verified_types = [a.attribute_type for a in verified.avps]
+    assert verified_types[:len(original_types)] == original_types
+
+
+def test_decode_and_verify_rejects_tampered_body():
+    avps = build_hello_avps()
+    msg = ControlMessage(control_connection_id=1, ns=0, nr=0, avps=avps)
+    wire = bytearray(msg.encode_signed(DigestHash.HMAC_MD5, _SIGNING_SECRET))
+    # Flip the LOW byte of the Message Type AVP's value.  The Message
+    # Type AVP is 8 bytes total (6-byte header + 2-byte value); its
+    # value byte 1 sits at offset HEADER_LEN+7 in the wire buffer.
+    # Flipping this changes the message meaning but keeps the AVP
+    # length field intact, so the decode succeeds and the digest
+    # check is what should reject.
+    wire[HEADER_LEN + 7] ^= 0x01
+    with pytest.raises(ValueError, match="verification failed"):
+        ControlMessage.decode_and_verify(
+            bytes(wire), DigestHash.HMAC_MD5, _SIGNING_SECRET
+        )
+
+
+def test_decode_and_verify_rejects_wrong_secret():
+    avps = build_hello_avps()
+    msg = ControlMessage(control_connection_id=1, ns=0, nr=0, avps=avps)
+    wire = msg.encode_signed(DigestHash.HMAC_MD5, _SIGNING_SECRET)
+    with pytest.raises(ValueError, match="verification failed"):
+        ControlMessage.decode_and_verify(
+            wire, DigestHash.HMAC_MD5, b"WRONG"
+        )
+
+
+def test_decode_and_verify_rejects_missing_digest_avp():
+    # Encode without signing, then try to verify.
+    unsigned = ControlMessage(
+        control_connection_id=1, ns=0, nr=0, avps=build_hello_avps()
+    ).encode()
+    with pytest.raises(ValueError, match="missing Message Digest AVP"):
+        ControlMessage.decode_and_verify(
+            unsigned, DigestHash.HMAC_MD5, _SIGNING_SECRET
+        )
+
+
+def test_decode_and_verify_rejects_wrong_hash_type():
+    avps = build_hello_avps()
+    msg = ControlMessage(control_connection_id=1, ns=0, nr=0, avps=avps)
+    wire = msg.encode_signed(DigestHash.HMAC_MD5, _SIGNING_SECRET)
+    with pytest.raises(ValueError, match="hash type mismatch"):
+        ControlMessage.decode_and_verify(
+            wire, DigestHash.HMAC_SHA1, _SIGNING_SECRET
+        )

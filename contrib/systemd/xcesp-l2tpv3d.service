@@ -1,0 +1,41 @@
+[Unit]
+Description=XCESP L2TPv3 (RFC 3931) dynamic-mode control-plane daemon
+Documentation=https://github.com/aibarguen72/xcesp-l2tpv3d
+# Wants network + syslog; if you rely on a specific interface being up,
+# add After=<that iface>.
+After=network-online.target syslog.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+
+ExecStart=/usr/local/bin/xcesp-l2tpv3d --config /etc/xcesp-l2tpv3d.toml
+Restart=on-failure
+RestartSec=5s
+
+# Bind to UDP port 1701 requires either root or CAP_NET_BIND_SERVICE;
+# creating l2tp interfaces (added in milestone 0.4.0+) requires
+# CAP_NET_ADMIN.
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+
+# Reasonable sandboxing.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+# Run as xcesp user if the surrounding XCESP install created it; fall
+# back to root if not.  The daemon needs the caps above regardless of
+# uid because bind(1701) + create-netdev require them.
+User=xcesp
+Group=xcesp
+
+[Install]
+WantedBy=multi-user.target

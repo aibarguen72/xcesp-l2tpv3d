@@ -613,6 +613,92 @@ def build_message_digest(hash_type: DigestHash | int, digest: bytes) -> AVP:
     )
 
 
+def build_receive_window_size(window: int) -> AVP:
+    """§5.4.3 (Receive Window Size, AVP 10) — 2-byte window size."""
+    if window < 0 or window > 0xFFFF:
+        raise ValueError(f"receive window out of range: {window}")
+    return AVP(
+        attribute_type=AttrType.RECEIVE_WINDOW_SIZE,
+        value=struct.pack("!H", window),
+        mandatory=True,
+    )
+
+
+def build_vendor_name(name: str | bytes) -> AVP:
+    """§5.4 legacy — Vendor Name AVP, optional descriptive string."""
+    if isinstance(name, str):
+        name = name.encode("utf-8")
+    return AVP(
+        attribute_type=AttrType.VENDOR_NAME,
+        value=name,
+        mandatory=False,   # optional per RFC
+    )
+
+
+def build_firmware_revision(revision: int) -> AVP:
+    """§5.4 legacy — Firmware Revision AVP (2-byte uint)."""
+    if revision < 0 or revision > 0xFFFF:
+        raise ValueError(f"firmware revision out of range: {revision}")
+    return AVP(
+        attribute_type=AttrType.FIRMWARE_REVISION,
+        value=struct.pack("!H", revision),
+        mandatory=False,   # optional per RFC
+    )
+
+
+def build_control_message_auth_nonce(nonce: bytes) -> AVP:
+    """§4.3 — Control Message Authentication Nonce (AVP 73).
+
+    Sent in SCCRQ (Local Nonce) and SCCRP (Remote Nonce).  These
+    nonces MAY be used as HMAC key material for the Message Digest
+    AVP; 0.3.0 provides the AVP but the digest algorithm uses the
+    shared secret directly (RFC-compatible message-integrity path).
+    """
+    if not nonce:
+        raise ValueError("nonce must not be empty")
+    return AVP(
+        attribute_type=AttrType.CTL_MSG_AUTH_NONCE,
+        value=nonce,
+        mandatory=True,
+    )
+
+
+def decode_control_message_auth_nonce(avp: AVP) -> bytes:
+    _require_attr(avp, AttrType.CTL_MSG_AUTH_NONCE, min_len=1)
+    return avp.value
+
+
+def decode_assigned_control_connection_id(avp: AVP) -> int:
+    _require_attr(avp, AttrType.ASSIGNED_CONTROL_CONNECTION_ID, exact_len=4)
+    (ccid,) = struct.unpack("!I", avp.value)
+    return ccid
+
+
+def decode_host_name(avp: AVP) -> bytes:
+    _require_attr(avp, AttrType.HOST_NAME, min_len=0)
+    return avp.value
+
+
+def decode_receive_window_size(avp: AVP) -> int:
+    _require_attr(avp, AttrType.RECEIVE_WINDOW_SIZE, exact_len=2)
+    (w,) = struct.unpack("!H", avp.value)
+    return w
+
+
+def find_avp(
+    avps: list["AVP"],
+    attribute_type: int,
+    vendor_id: int = VENDOR_IETF,
+) -> Optional["AVP"]:
+    """Return the first AVP matching ``(vendor_id, attribute_type)``,
+    or None.  Useful when message parsers want a single AVP without
+    iterating manually."""
+    for avp in avps:
+        if avp.vendor_id == vendor_id and avp.attribute_type == int(attribute_type):
+            return avp
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------

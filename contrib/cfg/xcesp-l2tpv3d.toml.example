@@ -1,0 +1,54 @@
+# xcesp-l2tpv3d — example TOML configuration
+#
+# Copy to /etc/xcesp-l2tpv3d.toml (or the path you launch the daemon
+# with via --config PATH).  The [global] section is optional; the
+# [[tunnel]] blocks are required — at least one, up to as many as
+# you want to establish on this router.
+
+[global]
+log_level      = "info"       # debug | info | warning | error
+listen_address = "0.0.0.0"    # UDP bind address for L2TP control
+listen_port    = 1701         # IANA-assigned L2TP UDP port
+
+
+# ---------------------------------------------------------------------
+# Example tunnel: two XCESP routers pointing at each other
+# ---------------------------------------------------------------------
+[[tunnel]]
+name           = "to-peer-B"          # operator label
+local_address  = "192.0.2.1"          # our source IP
+remote_address = "192.0.2.2"          # peer IP
+local_ccid     = 100                  # our Assigned Control Connection ID
+host_name      = "xcesp-router-A"     # Host Name AVP sent to peer
+router_id      = "10.0.0.1"           # Router ID AVP (v4 dotted or int)
+
+# Authentication.  If both peers configure the same password + digest
+# algorithm, every control message is HMAC-signed with a Message
+# Digest AVP.  Comment out to disable.
+password       = "topsecret"
+digest_alg     = "md5"                # md5 | sha1
+
+# Timing knobs (defaults shown).
+hello_interval        = 60            # seconds between HELLO keepalives
+retransmit_interval   = 1             # initial RTO for retransmit
+max_retries           = 5             # retransmits before peer marked dead
+receive_window        = 4             # sender's advertised recv-window
+
+# Optional descriptive AVPs.
+vendor_name           = "XCESP"
+firmware_revision     = 1
+
+# Speeds advertised in Tx/Rx Connect Speed AVPs (bits per second).
+tx_connect_speed      = 100000000     # 100 Mbps
+rx_connect_speed      = 100000000     # 100 Mbps
+
+
+# ---------------------------------------------------------------------
+# Session sub-blocks are recognised starting in xcesp-l2tpv3d 0.4.0
+# (Ethernet + Ethernet-VLAN pseudowires).  0.3.0 ignores them; leave
+# commented out until you upgrade.
+# ---------------------------------------------------------------------
+# [[tunnel.session]]
+# name           = "eth-xconnect"
+# session_type   = "ethernet"           # ethernet | ethernet-vlan
+# local_iface    = "eth1"               # ingress interface to bridge

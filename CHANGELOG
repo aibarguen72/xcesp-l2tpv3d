@@ -1,5 +1,83 @@
 # Changelog - xcesp-l2tpv3d
 
+## 0.3.0
+
+- **Tunnel state machine** (`xcesp_l2tpv3d/tunnel_fsm.py`) — the RFC
+  3931 §7.2.1 state matrix: `IDLE` → `WAIT_CTL_REPLY` (initiator sent
+  SCCRQ) or `WAIT_CTL_CONN` (responder sent SCCRP) → `ESTABLISHED` →
+  `SEND_STOPCCN` for teardown.  Handles both symmetric roles (either
+  peer can initiate) plus peer-restart (SCCRQ received while
+  ESTABLISHED → tear down and back to IDLE).  Time-agnostic like the
+  transport `Peer` — callers drive it via ``on_local_open``,
+  ``on_local_close``, ``on_message``, ``on_hello_timer``,
+  ``on_peer_dead``; the FSM returns typed ``Action`` objects
+  (``SendMessage``, ``SetHelloTimer``, ``ClearHelloTimer``,
+  ``Established``, ``TornDown``) the caller executes.
+- **Typed message builders** (`messages.py`) — one factory per RFC
+  3931 §6.x message: ``build_sccrq_avps``, ``build_sccrp_avps``,
+  ``build_scccn_avps``, ``build_hello_avps``, ``build_stopccn_avps``.
+  Each populates the mandatory AVPs (Router ID, Assigned Control
+  Connection ID, Pseudowire Capabilities List, Host Name, Receive
+  Window Size) plus optional AVPs (Vendor Name, Firmware Revision,
+  Control Message Authentication Nonce).  Symmetric parsers
+  ``parse_sccrx_fields`` / ``parse_stopccn_fields`` extract typed
+  ``SccrxFields`` / ``StopCcnFields`` dataclasses from received AVP
+  lists, with mandatory-field enforcement.
+- **Message Digest AVP authentication** (`auth.py` + `messages.py`) —
+  HMAC-MD5 or HMAC-SHA1 per RFC 3931 §5.4.3 + §4.4.  The signing
+  input is ``0x01 || full-message-bytes-with-digest-zeroed`` and the
+  HMAC key is the pre-shared secret.  Exposed via
+  ``ControlMessage.encode_signed(hash_type, secret)`` and
+  ``ControlMessage.decode_and_verify(buf, hash_type, secret)``.
+  Verification is position-independent (locates the Message Digest
+  AVP by parsing, not by fixed offset), uses ``hmac.compare_digest``
+  for timing-safety, and rejects on any of: missing digest AVP, wrong
+  hash type, wrong length, or verification failure.
+- **AVP additions** — Receive Window Size, Vendor Name, Firmware
+  Revision, Control Message Authentication Nonce (attr 73) builders
+  and decoders.  ``find_avp`` helper for message parsers to grab a
+  single AVP by (vendor, type) without hand-iterating.
+- **TOML config loader** (`config.py`) — `[global]` section
+  (log_level / listen_address / listen_port) plus one or more
+  `[[tunnel]]` blocks with strict validation and helpful error
+  messages.  Router ID accepts both dotted-quad strings and 32-bit
+  ints.  Passwords enable Message Digest AVP auth.  Range checks on
+  hello_interval / retransmit_interval / max_retries / receive_window
+  match RFC 3931 §5.8 guidance.  Uses Python 3.11+ stdlib ``tomllib``
+  (no external dep).
+- **Daemon entry point** (`main.py`) — asyncio event loop that binds
+  a single UDP socket via ``UdpTransport``, instantiates one
+  ``Tunnel`` (bundling a transport ``Peer`` + protocol-layer
+  ``TunnelFSM``) per configured entry, dispatches inbound datagrams
+  by Control Connection ID, drives a 0.5 s retransmit-and-HELLO
+  tick, sends ``sd_notify`` READY/STOPPING to systemd, and handles
+  SIGTERM / SIGINT gracefully.  Signed encoding + verification is
+  invoked automatically when a tunnel has ``password`` configured.
+- **Structured logging** (`log.py`) — thin ``logging`` wrapper with
+  per-tunnel loggers.  stderr → journald.
+- **Systemd unit** (`contrib/systemd/xcesp-l2tpv3d.service`) —
+  ``Type=notify`` for readiness reporting, capabilities set to just
+  what's needed (``CAP_NET_BIND_SERVICE`` for port 1701 +
+  ``CAP_NET_ADMIN`` for the 0.4.0+ dataplane netlink), aggressive
+  sandboxing (``ProtectSystem``, ``ProtectHome``,
+  ``ProtectKernelTunables``, restricted address families).
+- **Example config** (`contrib/cfg/xcesp-l2tpv3d.toml.example`) —
+  drop-in template covering every documented knob with default
+  values and Cisco-interop pointers.
+- **Integration tests** (`test/test_integration.py`) — two ``Tunnel``
+  objects wired via ``LoopbackTransport`` handshake to ESTABLISHED,
+  exchange HELLOs for several rounds, tear down via local close, and
+  the negative-path where mismatched shared secrets prevent
+  establishment.  Runs entirely in-process without root or real UDP.
+- **Bugfix in transport.Peer.receive** — now accepts messages with
+  Control Connection ID 0 (initial SCCRQ before the peer has learned
+  our Assigned CCID) OR ``local_ccid`` (post-handshake).  The old
+  0.2.0 strict check rejected every SCCRQ, which only mattered once
+  the FSM layer above tried to negotiate.
+
+- **Test count 117 → 206** (+89 new).  Full suite green in ~12 s
+  (0.5 s for pure unit + ~11 s for the async integration pump loops).
+
 ## 0.2.0
 
 - **ControlMessage wire codec** (`xcesp_l2tpv3d/messages.py`) — the 12-byte

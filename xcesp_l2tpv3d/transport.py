@@ -332,10 +332,12 @@ class Peer:
             The caller is free to skip the ZLB if it plans to piggyback
             the ack on an outgoing app-level message immediately.
         """
-        if msg.control_connection_id != self.local_ccid:
-            # Not for us; higher-level demux should have prevented
-            # this.  Silently drop; do not send a ZLB (no idea what
-            # peer to send to).
+        # Accept messages addressed to our local_ccid (normal case,
+        # post-handshake) or CCID=0 (initial SCCRQ before the peer has
+        # learned our Assigned Control Connection ID).  Reject anything
+        # else — the caller-level demux should have routed those to the
+        # right Peer already.
+        if msg.control_connection_id not in (0, self.local_ccid):
             return [], []
 
         # First: consume any acks piggy-backed on this message's Nr.
