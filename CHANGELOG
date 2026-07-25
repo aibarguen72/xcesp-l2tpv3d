@@ -1,0 +1,33 @@
+# Changelog - xcesp-l2tpv3d
+
+## 0.1.0
+
+- **First release of XCESP's L2TPv3 (RFC 3931) dynamic-mode
+  control-plane daemon.**  This is the first free-software Linux
+  implementation of the L2TPv3 control channel — OpenL2TP is
+  L2TPv2-only, go-l2tp's ql2tpd is static+keepalive between two
+  ql2tpd instances (not RFC 3931 negotiation), and prol2tp is
+  proprietary.
+- **Scope of 0.1.0** — subproject skeleton + AVP codec + unit
+  tests only.  No wire I/O.  Sets up the module layout the
+  0.2.x-0.9.x releases will fill in per the roadmap plan file.
+- **AVP codec** (`xcesp_l2tpv3d/avp.py`) — encode/decode of the RFC
+  3931 §5.2 AVP header (M/H bits, reserved, 10-bit length, vendor
+  ID, attribute type) plus per-type value serialisation for the
+  mandatory AVP set required by SCCRQ/SCCRP/SCCCN/ICRQ/ICRP/ICCN
+  message building in future releases: Message Type (0), Result
+  Code (1), Random Vector (36), Message Digest (59), Router ID
+  (60), Assigned Control Connection ID (61), Pseudowire
+  Capabilities List (62), Local Session ID (63), Remote Session
+  ID (64), Assigned Cookie (65), Remote End ID (66), Pseudowire
+  Type (68), L2-Specific Sublayer (69), Data Sequencing (70),
+  Circuit Status (71), Preferred Language (72), Tx Connect Speed
+  (74), Rx Connect Speed (75).
+- **Hidden-AVP path** (RFC 3931 §4.3) — MD5-keystream encryption
+  of Attribute Value using a shared secret + Random Vector AVP;
+  round-trips cleanly with a shared-secret fixture.
+- **Unit tests** (`test/test_avp.py`) — round-trip every
+  implemented AVP type, boundary lengths (empty value, 1-byte,
+  256-byte, max 1017-byte), malformed input rejection (short
+  header, over-long length, unknown vendor+type).  Runs via
+  `make test`.

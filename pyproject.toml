@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xcesp-l2tpv3d"
+version = "0.1.0"
+description = "L2TPv3 (RFC 3931) dynamic-mode control-plane daemon for XCESP"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "GPL-2.0-or-later" }
+authors = [{ name = "XCESP Project" }]
+dependencies = [
+    # 0.1.0 has no runtime deps beyond the stdlib.
+    # 0.4.0+ will add "pyroute2>=0.7" for netlink dataplane calls.
+    # 0.3.0+ will add "sdnotify" for systemd readiness (or hand-roll
+    # the sd_notify protocol against the AF_UNIX socket).
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[project.scripts]
+xcesp-l2tpv3d = "xcesp_l2tpv3d.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["xcesp_l2tpv3d*"]
