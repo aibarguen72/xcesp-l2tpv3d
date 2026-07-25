@@ -1,5 +1,54 @@
 # Changelog - xcesp-l2tpv3d
 
+## 0.2.0
+
+- **ControlMessage wire codec** (`xcesp_l2tpv3d/messages.py`) — the 12-byte
+  L2TPv3 control-message header per RFC 3931 §4.1.1: T/L/S flag bits,
+  4 reserved bits (validated zero on decode), 4-bit Version (=3),
+  Length (16-bit), Control Connection ID (32-bit), Ns (16-bit), Nr
+  (16-bit).  Encode + decode + ZLB detection.  Rejects data messages
+  (T=0), missing L/S bits, non-zero reserved bits, wrong version,
+  length/buffer mismatch, out-of-range CCID/Ns/Nr.
+- **Sequence-number arithmetic** (`seq_delta`, `seq_advance`) — wrap-
+  safe 16-bit comparison per RFC 3931 §5.8 (values in [0, 32767] mean
+  "ahead", values in [-32768, -1] mean "behind"; the 0x8000 boundary
+  is exactly `-0x8000` per L2TP half-window semantics).
+- **Peer state machine** (`xcesp_l2tpv3d/transport.py`) — per-remote
+  reliable delivery.  Time-agnostic: caller passes a monotonic `now`
+  on every call, so retransmit behaviour is deterministically
+  testable against a mocked clock.  Owns:
+    * `_ns_send` / `_nr_expect` counters (16-bit, wrap-safe).
+    * Send queue of unacked messages, cleared as peer's Nr advances.
+    * Reorder buffer bounded by `receive_window`.
+    * Retransmit timer with RFC 3931 §5.8 exponential back-off:
+      1s → 2s → 4s → 8s → 16s (capped, `RETRANSMIT_MAX_INTERVAL`).
+    * Dead-peer detection when `max_retries` exceeded.
+    * ZLB (Zero-Length Body) ack-only messages that don't consume Ns
+      and aren't themselves acked.
+    * Nr-refresh on retransmit (so the resent copy carries our latest
+      acknowledgement, not the stale Nr from first transmission).
+- **Transport abstraction** (`Transport` ABC + `UdpTransport` for
+  asyncio production + `LoopbackTransport` for tests).  Loopback
+  variant uses a shared in-memory fabric dict; supports `drop_next`
+  for injecting packet loss in tests.
+- **Unit tests** — 48 new (+69 from 0.1.0 = 117 total, 0.20s green):
+    * ControlMessage: ZLB / with-AVP round-trip, header flag byte
+      constant, version, length-match, plus 8 malformed-input rejects.
+    * seq_delta / seq_advance: zero, positive/negative no-wrap,
+      positive/negative across wrap, half-window boundary, wrap on advance.
+    * Peer.send: Ns assignment + advance, remote CCID stamping,
+      current Nr piggyback, empty-AVPs rejection, retransmit queueing.
+    * Peer.receive: in-order deliver, duplicate re-ack, out-of-order
+      within window (reorder queue drains when hole fills), outside
+      window drop, ZLB no-op, wrong-CCID drop.
+    * Ack consumption: piggybacked Nr and peer-ZLB both flush queue.
+    * Retransmit: RTO trigger, exponential back-off progression, cap
+      at 16s, dead-peer after max_retries, dead sticks, Nr refresh.
+    * LoopbackTransport: two-peer HELLO exchange + ack; lossy-drop
+      case where first datagram is dropped and retransmit recovers.
+- **pytest-asyncio** added as an optional test dep (auto-mode in
+  `pyproject.toml` so async tests need no decorator).
+
 ## 0.1.0
 
 - **First release of XCESP's L2TPv3 (RFC 3931) dynamic-mode

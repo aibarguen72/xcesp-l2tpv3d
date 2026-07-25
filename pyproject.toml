@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xcesp-l2tpv3d"
-version = "0.1.0"
+version = "0.2.0"
 description = "L2TPv3 (RFC 3931) dynamic-mode control-plane daemon for XCESP"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -18,7 +18,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=7.0"]
+test = ["pytest>=7.0", "pytest-asyncio>=0.21"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 [project.scripts]
 xcesp-l2tpv3d = "xcesp_l2tpv3d.main:main"
