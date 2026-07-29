@@ -1,5 +1,38 @@
 # Changelog - xcesp-l2tpv3d
 
+## 0.5.1 — first Cisco interop fix (milestone 0.6.0 progress)
+
+- **Fix: ICRQ was missing the Remote Session ID AVP** (type 64,
+  value MUST be 0 per RFC 3931 §3.4.3 since the peer has not yet
+  assigned us one).  `build_icrq_avps` in `messages.py` populated
+  Message Type / Local Session ID / Pseudowire Type / L2SS /
+  Data Sequencing / Circuit Status + optional AVPs, but omitted
+  Remote Session ID entirely — the corresponding `build_icrp_avps`
+  and `build_iccn_avps` include it correctly, so this was a
+  code-path oversight, not a design choice.
+
+  Symptom: Cisco IOS peer would complete SCCRQ/SCCRP/SCCCN
+  (tunnel reaches ESTABLISHED) then reject the follow-on ICRQ
+  with StopCCN Result Code 2 and the error text
+  `unsupported mandatory vendor AVP` — Cisco IOS's diagnostic
+  strings for RFC 3931 conformance failures are notoriously
+  imprecise and mislabel a "missing mandatory AVP" as "vendor
+  AVP".  Discovered on the first live Cisco interop test on
+  XCESPFC (2026-07-28) via pcap analysis of the exchange.
+
+  Fix is one line in `build_icrq_avps`: insert
+  `build_remote_session_id(0)` immediately after
+  `build_local_session_id(local_sid)`, matching RFC 3931 §3.4.3's
+  required-AVP ordering.  All 260 existing tests still pass —
+  this reflects a test-coverage gap for ICRQ-vs-RFC-conformance,
+  not a behavior regression.
+
+  Expected outcome after this fix: Cisco peer accepts ICRQ →
+  responds with ICRP → we send ICCN → session reaches ESTABLISHED
+  and HELLO exchange stabilises.  Further AVP-level issues may
+  still surface in that follow-on exchange (milestone 0.6.0 will
+  continue iterating).
+
 ## 0.5.0
 
 - **XCESP integration milestone**: the daemon is now wired into the

@@ -394,15 +394,25 @@ def build_icrq_avps(
 ) -> List[AVP]:
     """Assemble the AVP list for an Incoming-Call-Request (§6.6).
 
-    Mandatory: Message Type, Local Session ID, Pseudowire Type.  L2-
-    Specific Sublayer + Data Sequencing + Circuit Status are strongly
-    recommended for RFC-conformant handshake.  Remote End ID identifies
-    the session at the peer (used for demultiplexing when the peer has
-    multiple pre-configured sessions).
+    Mandatory per RFC 3931 §3.4.3: Message Type, Local Session ID,
+    Remote Session ID (MUST be 0 — peer has not yet assigned us one),
+    Pseudowire Type, Circuit Status.  L2-Specific Sublayer + Data
+    Sequencing are strongly recommended for RFC-conformant handshake.
+    Remote End ID identifies the session at the peer (used for
+    demultiplexing when the peer has multiple pre-configured sessions).
+
+    Fixed in 0.5.1: Remote Session ID was missing from the AVP list,
+    causing Cisco to reject the ICRQ with a generic error text
+    ("unsupported mandatory vendor AVP" — Cisco IOS's error strings
+    are imprecise for RFC 3931 conformance failures).  Discovered via
+    pcap of the first live Cisco interop test on XCESPFC (2026-07-28)
+    where the SCCRQ/SCCRP/SCCCN reached ESTABLISHED but the follow-on
+    ICRQ was rejected by the peer.
     """
     avps: List[AVP] = [
         build_message_type(MessageType.ICRQ),
         build_local_session_id(local_sid),
+        build_remote_session_id(0),   # RFC 3931 §3.4.3: MUST be 0 in ICRQ
         build_pseudowire_type(pseudowire_type),
         build_l2_specific_sublayer(l2_specific_sublayer),
         build_data_sequencing(data_sequencing),
